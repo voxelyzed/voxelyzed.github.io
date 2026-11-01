@@ -251,6 +251,7 @@ body[data-m="studio"][data-gui-mode="1"] #properties .tabs button.active{
       <p class="hint" style="margin:0 0 12px">Crie um mundo e compartilhe o código. Quem entrar verá os jogos publicados nele e poderá jogar com você. O criador precisa manter o Voxelyzed aberto para hospedar.</p>
       <div class="row" style="flex-wrap:wrap"><button class="pri" id="worldCreate">＋ Criar meu mundo</button><input id="worldJoinCode" maxlength="12" placeholder="Código do mundo (até 12 caracteres)" style="width:min(320px,100%);text-transform:uppercase"><button id="worldJoin">Entrar no mundo</button><button id="worldCopy" style="display:none">📋 Copiar código</button></div>
       <div id="worldStatus" class="hint" style="margin-top:10px"></div>
+      <div id="worldSavedList" style="display:flex;flex-direction:column;gap:6px;margin-top:10px"></div>
     </section>
     <h2 style="margin:0 0 12px;font-size:18px">🎮 Jogos</h2>
     <div class="grid" id="grid"></div>
@@ -1365,24 +1366,28 @@ const NET = { peer: null, conns: [], conn: null, role: 'solo', timer: null }, NE
 const netStatus = t => { const s = document.getElementById('netStatus'); if (s) s.textContent = t; };
 function netShowPanel(v) { const el = document.getElementById('netPanel'); if (el) el.style.display = v ? 'block' : 'none'; }
 function ensureNetPanel() { if (document.getElementById('netPanel')) return; document.body.insertAdjacentHTML('beforeend', '<div id="netPanel" style="position:fixed;top:70px;right:12px;z-index:50;background:#1b1e24ee;color:#eee;padding:10px;border-radius:10px;display:none"><b>🌐 Mundo</b><div id="netStatus"></div></div>'); }
-function netDisconnect() { try { NET.conns.forEach(c => c.close()); NET.conn?.close(); NET.peer?.destroy(); } catch (e) {} for (const id of [...NET_R.keys()]) netRemove(id); clearInterval(NET.timer); Object.assign(NET, { peer: null, conns: [], conn: null, role: 'solo', timer: null }); NET_Q.length = 0; }
-function netOpen(peer) { NET.peer = peer; NET.timer = setInterval(() => { if (!NET.peer?.id || !me) return; const m = { t: 'pos', id: NET.peer.id, x: me.x, y: me.y, z: me.z, rot: me.rot, emote: me.emote, g: me.grounded, vy: me.vy, av: state.avatar }; if (NET.role === 'host') NET.conns.forEach(c => c.open && c.send(m)); else NET.conn?.open && NET.conn.send(m); }, 100); }
+function netDisconnect() { try { NET.conns.forEach(c => c.close()); NET.conn?.close(); NET.peer?.destroy(); } catch (e) {} clearNetPlayers();clearInterval(NET.timer); Object.assign(NET, { peer: null, conns: [], conn: null, role: 'solo', timer: null, worldCode: null }); NET_Q.length = 0; }
+function netOpen(peer) { NET.peer = peer; NET.timer = setInterval(() => { if (!NET.peer?.id || !me || view!=='play' || !currentPlay) return; const m = { t: 'pos', id: NET.peer.id, gameId: currentPlay.id || currentPlay.name, x: me.x, y: me.y, z: me.z, rot: me.rot, emote: me.emote, g: me.grounded, vy: me.vy, av: state.avatar }; if (NET.role === 'host') NET.conns.forEach(c => c.open && c.gameId===m.gameId && c.send(m)); else NET.conn?.open && NET.conn.send(m); }, 100); }
 function worldCode() { return String(localStorage.bv2_world_code || ''); }
-function worldCatalog() { return loadLib().filter(p=>!p.worldCode||p.worldCode===worldCode()).map(p => ({ id:p.id, name:p.name, desc:p.desc||'', author:p.author||'Anônimo' })); }
+function accountWorlds() { try { return JSON.parse(localStorage.bv2_worlds||'[]'); } catch { return []; } }
+function rememberWorld(code,role) { code=String(code||'').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,12);if(!code)return;const list=accountWorlds();const found=list.find(w=>w.code===code);if(found){if(found.role!=='owner'&&role)found.role=role;found.lastUsed=Date.now();}else list.unshift({code,role:role||'joined',lastUsed:Date.now()});try{localStorage.bv2_worlds=JSON.stringify(list.slice(0,50));}catch{} }
+function worldCatalog() { const code=NET.worldCode||worldCode();return loadLib().filter(p=>!p.worldCode||p.worldCode===code).map(p => ({ id:p.id, name:p.name, desc:p.desc||'', author:p.author||'Anônimo' })); }
 function showWorldCatalog(items) { let el=document.getElementById('worldCatalog'); if(!el){el=document.createElement('div');el.id='worldCatalog';el.className='modal on';document.body.append(el);} el.innerHTML='<div class="box"><h2>🌐 Jogos deste mundo</h2><p class="hint">Escolha um jogo publicado para jogar com o criador.</p><div id="worldCatalogList" class="grid"></div><div class="row" style="justify-content:flex-end;margin-top:12px"><button id="worldCatalogClose">Fechar</button></div></div>'; const list=el.querySelector('#worldCatalogList'); items.forEach(p=>{const card=document.createElement('div');card.className='card';const title=document.createElement('b');title.textContent=p.name;const desc=document.createElement('p');desc.textContent=p.desc||'Sem descrição';const go=document.createElement('button');go.className='pri';go.textContent='▶ Jogar com o mundo';go.onclick=()=>{NET.conn?.send({t:'select',id:p.id});el.remove();};card.append(title,desc,go);list.append(card);}); el.querySelector('#worldCatalogClose').onclick=()=>el.remove(); }
-function netCreateWorld(code='') { if(NET.role==='host'&&NET.peer&&!NET.peer.destroyed){const s=$('#worldStatus');if(s)s.textContent='Seu mundo já está online. Código: '+NET.worldCode;return;} netDisconnect();if(!code)code=Array.from({length:12},()=> 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'[Math.floor(Math.random()*36)]).join('');localStorage.bv2_world_code=code;const peer=new Peer('vx'+code.toLowerCase());netOpen(peer);peer.on('open',()=>{NET.role='host';NET.worldCode=code;const s=$('#worldStatus');if(s)s.textContent='Seu mundo está online. Código: '+code+' — mantenha esta página aberta para receber jogadores.';const copy=$('#worldCopy');if(copy)copy.style.display='inline-block';});peer.on('error',e=>{const s=$('#worldStatus');if(s)s.textContent=e.type==='unavailable-id'?'Este código já está sendo usado. Crie outro mundo.':'Não foi possível hospedar: '+e.type;});peer.on('connection',c=>{NET.conns.push(c);c.on('data',m=>netHost(m,c));c.on('open',()=>c.send({t:'catalog',items:worldCatalog()}));c.on('close',()=>{NET.conns=NET.conns.filter(x=>x!==c);netRemove(c.peer);});}); }
-function netJoinWorld(raw) { const code=String(raw).toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,12);if(!code)return toast('Digite o código do mundo');netDisconnect();const peer=new Peer();netOpen(peer);peer.on('error',e=>{const s=$('#worldStatus');if(s)s.textContent=e.type==='peer-unavailable'?'Mundo não encontrado. Confira o código e se o criador está online.':'Erro de conexão: '+e.type;});peer.on('open',()=>{const c=peer.connect('vx'+code.toLowerCase());NET.worldCode=code;c.on('open',()=>{NET.conn=c;NET.role='guest';const s=$('#worldStatus');if(s)s.textContent='Conectado ao mundo '+code+'. Carregando jogos…';});c.on('data',m=>netGuest(m,c));c.on('close',()=>{const s=$('#worldStatus');if(s)s.textContent='A conexão com o mundo foi encerrada.';});}); }
-function netGuest(m,c) { if(m.t==='catalog')showWorldCatalog(m.items||[]);else if(m.t==='world'){Runner.end();playProject(m.p,'world');}else if(m.t==='cmds')applyCmds(m.list.filter(([op])=>op!=='tp'));else if(m.t==='pos')netPos(m,c); }
-function netHost(m,c) { if(m.t==='pos')netPos(m,c);else if(m.t==='touch')NET_Q.push(...m.names);else if(m.t==='click')Runner.clickGUI(m.name);else if(m.t==='select'){const p=loadLib().find(x=>x.id===m.id);if(!p){c.send({t:'catalog',items:worldCatalog()});return;}if(view!=='play'||currentPlay?.id!==p.id)playProject(p,'home');c.send({t:'world',p});} }
+function netCreateWorld(code='') { if(NET.role==='host'&&NET.peer&&!NET.peer.destroyed&&(!code||NET.worldCode===code)){const s=$('#worldStatus');if(s)s.textContent='Seu mundo já está online. Código: '+NET.worldCode;return;} netDisconnect();if(!code)code=Array.from({length:12},()=> 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'[Math.floor(Math.random()*36)]).join('');localStorage.bv2_world_code=code;rememberWorld(code,'owner');const peer=new Peer('vx'+code.toLowerCase());netOpen(peer);peer.on('open',()=>{NET.role='host';NET.worldCode=code;const s=$('#worldStatus');if(s)s.textContent='Seu mundo está online. Código: '+code+' — mantenha esta página aberta para receber jogadores.';const copy=$('#worldCopy');if(copy)copy.style.display='inline-block';});peer.on('error',e=>{const s=$('#worldStatus');if(s)s.textContent=e.type==='unavailable-id'?'Este código já está sendo usado. Crie outro mundo.':'Não foi possível hospedar: '+e.type;});peer.on('connection',c=>{NET.conns.push(c);c.gameId=null;c.on('data',m=>netHost(m,c));c.on('open',()=>c.send({t:'catalog',items:worldCatalog()}));c.on('close',()=>{NET.conns=NET.conns.filter(x=>x!==c);netRemove(c.peer);});}); }
+function netJoinWorld(raw) { const code=String(raw).toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,12);if(!code)return toast('Digite o código do mundo');netDisconnect();const peer=new Peer();netOpen(peer);peer.on('error',e=>{const s=$('#worldStatus');if(s)s.textContent=e.type==='peer-unavailable'?'Mundo não encontrado. Confira o código e se o criador está online.':'Erro de conexão: '+e.type;});peer.on('open',()=>{const c=peer.connect('vx'+code.toLowerCase());NET.worldCode=code;c.on('open',()=>{NET.conn=c;NET.role='guest';rememberWorld(code,'joined');const s=$('#worldStatus');if(s)s.textContent='Conectado ao mundo '+code+'. Carregando jogos…';});c.on('data',m=>netGuest(m,c));c.on('close',()=>{clearNetPlayers();NET.role='solo';const s=$('#worldStatus');if(s)s.textContent='A conexão com o mundo foi encerrada.';});}); }
+function netGuest(m,c) { if(m.t==='catalog')showWorldCatalog(m.items||[]);else if(m.t==='world'){Runner.end();playProject(m.p,'world');}else if(m.t==='clearPlayers')clearNetPlayers();else if(m.t==='published')toast(m.ok?'Jogo publicado no mundo!':(m.error||'Não foi possível publicar no mundo.'));else if(m.t==='cmds')applyCmds(m.list.filter(([op])=>op!=='tp'));else if(m.t==='pos')netPos(m,c); }
+function netHost(m,c) { if(m.t==='pos')netPos(m,c);else if(m.t==='touch')NET_Q.push(...m.names);else if(m.t==='click')Runner.clickGUI(m.name);else if(m.t==='publish'){if(m.entry?.worldCode!==(NET.worldCode||worldCode())){c.send({t:'published',ok:false,error:'O jogo foi enviado para outro mundo.'});return;}const lib=loadLib(),i=lib.findIndex(p=>p.id===m.entry.id);if(i>=0)lib[i]=m.entry;else lib.push(m.entry);saveLib(lib);c.send({t:'published',ok:true});}else if(m.t==='select'){const p=loadLib().find(x=>x.id===m.id);if(!p){c.send({t:'catalog',items:worldCatalog()});return;}if(view!=='play'||currentPlay?.id!==p.id)NET.conns.forEach(x=>x.open&&x.send({t:'clearPlayers'}));c.gameId=p.id||p.name;if(view!=='play'||currentPlay?.id!==p.id)playProject(p,'home');c.send({t:'world',p});} }
 function netPos(m, from) {
+  if(view!=='play'||!currentPlay||(currentPlay.id||currentPlay.name)!==m.gameId){netRemove(m.id);return;}
   if (m.id !== NET.peer.id) {
     let r = NET_R.get(m.id);
     if (!r) { r = { rig: buildRig(m.av || state.avatar), x: m.x, y: m.y, z: m.z, speed: 0, phase: 0 }; scene.add(r.rig.root); NET_R.set(m.id, r); }
     Object.assign(r, { tx: m.x, ty: m.y, tz: m.z, rot: m.rot || 0, emote: m.emote || 0, grounded: !!m.g, vy: m.vy || 0 });
   }
-  if (NET.role === 'host') NET.conns.forEach(c => c.open && c !== from && c.send(m));
+  if (NET.role === 'host') NET.conns.forEach(c => c.open && c !== from && c.gameId===m.gameId && c.send(m));
 }
 function netRemove(id) { const r = NET_R.get(id); if (r) { scene.remove(r.rig.root); NET_R.delete(id); } }
+function clearNetPlayers() { for(const id of [...NET_R.keys()])netRemove(id); }
 function netUpdate(dt, t) {
   for (const r of NET_R.values()) {
     const dx = r.tx - r.x, dz = r.tz - r.z, k = Math.min(1, dt * 12), rig = r.rig;
@@ -3559,7 +3564,7 @@ function renderProjectTab() {
   $('#projDesc').oninput = e => { draftDesc = e.target.value; saveDraft(); };
   $('#script').oninput = e => { draftScript = e.target.value; saveDraft(); };
   $('#btnPlay2').onclick = startPlayTest;
-  $('#btnPub').onclick = publishGame;
+  $('#btnPub').onclick = openPublishWorldPicker;
 }
 
 function renderPalette() {
@@ -3631,15 +3636,29 @@ function enterStudio(fromProject) {
   updateSelOutline();
 }
 function startPlayTest() { saveDraft(); playProject(currentDraft(), 'studio'); }
-function publishGame() {
+function openPublishWorldPicker() {
+  const worlds=accountWorlds().sort((a,b)=>(b.lastUsed||0)-(a.lastUsed||0));
+  if(!worlds.length){toast('Crie ou entre em um mundo antes de publicar.');return;}
+  const modal=document.createElement('div');modal.className='modal on';modal.id='publishWorldModal';
+  modal.innerHTML='<div class="box"><h2>🌐 Publicar em um mundo</h2><p class="hint">Escolha em qual mundo este jogo ficará disponível.</p><div id="publishWorldOptions" style="display:flex;flex-direction:column;gap:8px"></div><div class="row" style="justify-content:flex-end;margin-top:14px"><button id="publishWorldCancel">Cancelar</button><button class="pri" id="publishWorldConfirm">Publicar jogo</button></div></div>';
+  document.body.append(modal);const options=modal.querySelector('#publishWorldOptions');
+  worlds.forEach((w,i)=>{const label=document.createElement('label');label.style.cssText='display:flex;align-items:center;gap:10px;background:#2a2e36;padding:12px;border-radius:8px;cursor:pointer';label.innerHTML='<input type="radio" name="publishWorld" value="'+w.code+'" '+(i===0?'checked':'')+'><span><b></b><small style="display:block;color:#9aa3af"></small></span>';label.querySelector('b').textContent=w.code;label.querySelector('small').textContent=w.role==='owner'?'Seu mundo':'Mundo acessado';options.append(label);});
+  modal.querySelector('#publishWorldCancel').onclick=()=>modal.remove();modal.querySelector('#publishWorldConfirm').onclick=()=>{const code=modal.querySelector('input[name="publishWorld"]:checked')?.value;modal.remove();if(code)publishGame(code);};
+}
+function publishGame(targetCode) {
   const d = currentDraft();
   if (!d.name || d.name === 'Meu jogo') { toast('Dê um nome ao jogo'); return; }
+  const code=String(targetCode||'').toUpperCase();
+  const canShare=(NET.role==='host'&&(NET.worldCode||worldCode())===code)||(NET.role==='guest'&&NET.worldCode===code&&NET.conn?.open);
+  if(!canShare){toast('Entre nesse mundo ou hospede-o antes de publicar nele.');return;}
   const lib = loadLib();
   const id = draftId || uid();
-  const entry = { id, name: d.name, desc: d.desc, author: d.author, script: d.script, world: d.world, gui: d.gui, animations: d.animations, worldCode: worldCode() || null };
+  const entry = { id, name: d.name, desc: d.desc, author: d.author, script: d.script, world: d.world, gui: d.gui, animations: d.animations, worldCode: code };
+  rememberWorld(code,'published');
   const i = lib.findIndex(p => p.id === id);
   if (i >= 0) lib[i] = entry; else lib.push(entry);
   saveLib(lib); draftId = id; saveDraft();
+  if(NET.role==='guest')NET.conn.send({t:'publish',entry});
   $('#codeOut').value = b64enc(entry);
   $('#codeModal').classList.add('on'); $('#codeOut').select();
   Sound.success();
@@ -3693,6 +3712,7 @@ function updatePlay(dt, t) {
   applyPose(myRig, playerAnimationPose(dt) || poseTarget({ emote: me.emote, grounded: me.grounded, vy: me.vy, speed: me.speed, phase: me.phase }, t), dt);
 }
 function playProject(p, from) {
+  clearNetPlayers();
   activeAnimation = null;
   p = { ...p, animations: normalizeAnimations(p.animations) };
   playFrom = from; currentPlay = p; go('play'); setWorld(p.world); orbit.dist = 9; me = newPlayer();
@@ -3703,7 +3723,7 @@ function playProject(p, from) {
   if (NET.role !== 'guest') Runner.begin((p.script || '') + '\n' + compileBlocks(p.world || []));
   renderPlayerList();
 }
-function exitPlay() { if(NET.role!=='host'||!worldCode())netDisconnect(); netShowPanel(false); touchCtrlShow(false); Runner.end(); currentPlay = null; $('#guiRuntime').querySelector('.guiContainer').innerHTML = ''; if (playFrom === 'studio') enterStudio(); else enterHome(); }
+function exitPlay() { if(NET.role==='host')NET.conns.forEach(c=>c.open&&c.send({t:'clearPlayers'}));clearNetPlayers();if(NET.role!=='host'||!worldCode())netDisconnect(); netShowPanel(false); touchCtrlShow(false); Runner.end(); currentPlay = null; $('#guiRuntime').querySelector('.guiContainer').innerHTML = ''; if (playFrom === 'studio') enterStudio(); else enterHome(); }
 
 function opts(el, list, key) {
   el.innerHTML = '';
@@ -3743,6 +3763,7 @@ function saveLib(l) { try { localStorage.bv2_lib = JSON.stringify(l); } catch (e
 function thumbEmoji(name) { if (/obby|parkour/i.test(name)) return '🏃'; if (/tycoon|build|city/i.test(name)) return '🏗'; if (/adventure|quest/i.test(name)) return '🗺'; if (/fight|combat|pvp/i.test(name)) return '⚔'; return '🎮'; }
 function renderHome() {
   const status=$('#worldStatus'),copy=$('#worldCopy');if(status&&NET.role==='host')status.textContent='Seu mundo está online. Código: '+NET.worldCode+' — mantenha esta página aberta para receber jogadores.';else if(status&&worldCode())status.textContent='Código salvo: '+worldCode()+'. Crie seu mundo para hospedar e receber jogadores.';if(copy)copy.style.display=worldCode()?'inline-block':'none';
+  const saved=$('#worldSavedList');if(saved){saved.innerHTML='';for(const w of accountWorlds().sort((a,b)=>(b.lastUsed||0)-(a.lastUsed||0))){const row=document.createElement('div');row.className='row';row.style.cssText='background:#101217;padding:8px 10px;border-radius:8px;justify-content:space-between;flex-wrap:wrap';const title=document.createElement('span');title.textContent=w.code+' · '+(w.role==='owner'?'meu mundo':w.role==='published'?'publicado':'acessado');const actions=document.createElement('div');actions.className='row';const use=document.createElement('button');use.textContent='Usar código';use.onclick=()=>{$('#worldJoinCode').value=w.code;};actions.append(use);if(w.role==='owner'){const host=document.createElement('button');host.textContent='Hospedar';host.onclick=()=>netCreateWorld(w.code);actions.append(host);}else{const join=document.createElement('button');join.textContent='Entrar';join.onclick=()=>netJoinWorld(w.code);actions.append(join);}row.append(title,actions);saved.append(row);}}
   const grid = $('#grid'); grid.innerHTML = '';
   const all = [DEMO, ...loadLib()];
   for (const p of all) {
