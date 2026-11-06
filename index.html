@@ -1358,7 +1358,7 @@ function ensureTouchCtrl() {
 // Tenta os servidores da lista em ordem; todos os jogadores acabam no primeiro que estiver no ar.
 const NET_BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt', 'wss://test.mosquitto.org:8081/mqtt'];
 const NET_NS = 'voxelyzed-mp1', NET_MAX = 8;
-const NET = { cli: null, ready: false, connGen: 0, id: '', gk: '', role: 'solo', code: '', hostId: null, gotWorld: false, wc: null, quick: false, onFail: null, gen: 0, tk: 0, timer: null, lastKey: '', lastSend: 0, lastAv: 0, lastN: 0, pend: [], seen: new Map(), rooms: new Map(), admitted: new Set(), sending: new Set(), cmdBuf: [], tried: new Set() }, NET_Q = [], NET_R = new Map();
+const NET = { cli: null, ready: false, connGen: 0, id: '', gk: '', role: 'solo', code: '', hostId: null, gotWorld: false, wc: null, quick: false, onFail: null, gen: 0, tk: 0, timer: null, lastKey: '', lastSend: 0, lastAv: 0, lastN: 0, pend: [], ping: 0, lastPos: null, lastMoving: false, seen: new Map(), rooms: new Map(), admitted: new Set(), sending: new Set(), cmdBuf: [], tried: new Set() }, NET_Q = [], NET_R = new Map();
 const netNewId = () => 'p' + Math.random().toString(36).slice(2, 10);
 NET.id = netNewId();
 const netDec = p => { try { return new TextDecoder().decode(p); } catch (e) { return String(p); } };
@@ -1387,7 +1387,7 @@ function netConnect(then) {
     let cli, up = false;
     try { cli = mqtt.connect(NET_BROKERS[i], { clientId: 'vx_' + NET.id, clean: true, keepalive: 20, connectTimeout: 6000, reconnectPeriod: 0, will: { topic: NET_NS + '/r/' + NET.gk + '/' + NET.id, payload: '', qos: 0, retain: true } }); } catch (e) { attempt(i + 1); return; }
     NET.cli = cli;
-    cli.on('connect', () => { if (NET.connGen !== gen) { try { cli.end(true); } catch (e) {} return; } up = true; NET.ready = true; cli.subscribe(NET_NS + '/r/' + NET.gk + '/+', { qos: 0 }); done(true); });
+    cli.on('connect', () => { if (NET.connGen !== gen) { try { cli.end(true); } catch (e) {} return; } up = true; NET.ready = true; cli.subscribe(NET_NS + '/r/' + NET.gk + '/+', { qos: 0 }); cli.subscribe(NET_NS + '/ping/' + NET.id, { qos: 0 }); done(true); });
     cli.on('message', (t, pl) => { if (NET.cli === cli) netOnMsg(t, netDec(pl)); });
     cli.on('error', () => {});
     cli.on('close', () => {
@@ -1408,11 +1408,12 @@ function netLeaveRoom() {
   if (NET.code && NET.ready) { netBc({ t: 'bye' }); try { NET.cli.unsubscribe(NET_NS + '/m/' + NET.code); } catch (e) {} if (NET.role === 'host') netPub(NET_NS + '/r/' + NET.gk + '/' + NET.id, '', true); }
   clearInterval(NET.timer); NET.timer = null; NET.gen++;
   for (const id of [...NET_R.keys()]) netRemove(id);
-  Object.assign(NET, { role: 'solo', code: '', hostId: null, gotWorld: false, wc: null, quick: false, onFail: null, lastKey: '', lastN: 0 });
+  Object.assign(NET, { role: 'solo', code: '', hostId: null, gotWorld: false, wc: null, quick: false, onFail: null, lastKey: '', lastN: 0, lastPos: null, lastMoving: false });
   NET.seen.clear(); NET.admitted.clear(); NET.sending.clear(); NET.cmdBuf.length = 0; NET_Q.length = 0;
 }
 // ---- recepção ----
 function netOnMsg(topic, txt) {
+  if (topic === NET_NS + '/ping/' + NET.id) { const d = performance.now() - parseFloat(txt); if (d >= 0 && d < 5000) NET.ping = NET.ping ? Math.round(NET.ping * 0.7 + d * 0.3) : Math.round(d); return; }
   if (topic.startsWith(NET_NS + '/r/')) {
     const id = topic.split('/').pop();
     if (!txt) NET.rooms.delete(id);
@@ -1463,26 +1464,37 @@ async function netSendWorld(to) {
 function netPos(m) {
   const id = m.f; if (NET.role === 'guest' && !NET.gotWorld) return;
   if (![m.x, m.y, m.z].every(Number.isFinite)) return;
+  const now = performance.now(), cl = v => Math.max(-20, Math.min(20, +v || 0));
   let r = NET_R.get(id);
   if (!r) { if (!m.av) return; r = { rig: buildRig(m.av), x: m.x, y: m.y, z: m.z, speed: 0, phase: 0 }; scene.add(r.rig.root); NET_R.set(id, r); }
-  Object.assign(r, { tx: m.x, ty: m.y, tz: m.z, rot: m.rot || 0, emote: m.emote || 0, grounded: !!m.g, vy: m.vy || 0 });
+  if (Math.hypot(m.x - r.x, m.z - r.z) > 6) { r.x = m.x; r.z = m.z; r.y = m.y; }
+  Object.assign(r, { tx: m.x, ty: m.y, tz: m.z, vx: cl(m.vx), vz: cl(m.vz), pt: now, rot: m.rot || 0, emote: m.emote || 0, grounded: !!m.g, vy: m.vy || 0 });
 }
 // ---- salas ----
-function netStatusLine() { if (!NET.code) return; netStatus((NET.role === 'host' ? 'Anfitrião · sala ' : 'Online · sala ') + NET.code.toUpperCase() + ' · ' + (1 + NET.seen.size) + '/' + NET_MAX + ' jogadores'); }
-function netStartTimers() { clearInterval(NET.timer); NET.tk = 0; NET.timer = setInterval(() => { NET.tk++; netTick(); if (NET.tk % 8 === 0) netSweep(); }, 125); }
+function netStatusLine() { if (!NET.code) return; netStatus((NET.role === 'host' ? 'Anfitrião · sala ' : 'Online · sala ') + NET.code.toUpperCase() + ' · ' + (1 + NET.seen.size) + '/' + NET_MAX + ' jogadores' + (NET.ping ? ' · ' + NET.ping + ' ms' : '')); }
+function netStartTimers() { clearInterval(NET.timer); NET.tk = 0; NET.timer = setInterval(() => { NET.tk++; netTick(); if (NET.tk % 17 === 0) netSweep(); }, 60); }
+const NET_ABS = new Set(['move', 'color', 'vis', 'rot', 'size']);
+function netFlushCmds() {
+  if (NET.cmdBuf.length > 6000) NET.cmdBuf.splice(0, NET.cmdBuf.length - 6000);
+  const src = NET.cmdBuf.splice(0), last = new Map(), out = [];
+  for (const c of src) { const op = c[0], a = c[1]; if (NET_ABS.has(op) && Array.isArray(a)) { const k = op + '|' + a[0]; if (last.has(k)) out[last.get(k)] = null; last.set(k, out.length); } out.push(c); }
+  const list = out.filter(Boolean);
+  for (let i = 0; i < list.length; i += 400) netBc({ t: 'cmds', list: list.slice(i, i + 400) });
+}
 function netTick() {
   if (!NET.code) return;
-  if (NET.role === 'host' && NET.cmdBuf.length) { if (NET.cmdBuf.length > 4000) NET.cmdBuf.splice(0, NET.cmdBuf.length - 4000); netBc({ t: 'cmds', list: NET.cmdBuf.splice(0, 400) }); }
+  if (NET.role === 'host' && NET.cmdBuf.length) netFlushCmds();
   if (!me || (NET.role === 'guest' && !NET.gotWorld)) return;
-  const now = performance.now(), r = v => Math.round(v * 100) / 100;
-  const m = { t: 'pos', x: r(me.x), y: r(me.y), z: r(me.z), rot: r(me.rot || 0), emote: me.emote, g: me.grounded, vy: r(me.vy || 0) };
-  const k = [m.x, m.y, m.z, m.rot, m.emote, m.g].join(), needAv = now - NET.lastAv > 3000;
-  if (k === NET.lastKey && now - NET.lastSend < 1000 && !needAv) return;
-  NET.lastKey = k; NET.lastSend = now; if (needAv) { m.av = state.avatar; NET.lastAv = now; }
+  const now = performance.now(), r = v => Math.round(v * 100) / 100, dts = (now - NET.lastSend) / 1000;
+  let vx = 0, vz = 0; if (NET.lastPos && dts > 0 && dts < 0.5) { vx = (me.x - NET.lastPos[0]) / dts; vz = (me.z - NET.lastPos[1]) / dts; }
+  const m = { t: 'pos', x: r(me.x), y: r(me.y), z: r(me.z), rot: r(me.rot || 0), emote: me.emote, g: me.grounded, vy: r(me.vy || 0), vx: Math.round(vx * 10) / 10, vz: Math.round(vz * 10) / 10 };
+  const k = [m.x, m.y, m.z, m.rot, m.emote, m.g].join(), needAv = now - NET.lastAv > 3000, moving = Math.hypot(vx, vz) > 0.05;
+  if (k === NET.lastKey && now - NET.lastSend < 1000 && !needAv && !NET.lastMoving) return;
+  NET.lastKey = k; NET.lastSend = now; NET.lastPos = [me.x, me.z]; NET.lastMoving = moving; if (needAv) { m.av = state.avatar; NET.lastAv = now; }
   netBc(m);
 }
 function netSweep() {
-  const now = performance.now();
+  const now = performance.now(); netPub(NET_NS + '/ping/' + NET.id, now);
   for (const [id, t] of [...NET.seen]) if (now - t > 7000) { NET.seen.delete(id); NET.admitted.delete(id); netRemove(id); }
   if (NET.role === 'guest' && NET.gotWorld && NET.hostId && !NET.seen.has(NET.hostId)) { netHostLost(); return; }
   if (NET.role === 'host') { netBc({ t: 'hb' }); const n = 1 + NET.seen.size; if (n !== NET.lastN) { NET.lastN = n; netListRoom(); } }
@@ -1532,10 +1544,12 @@ function netCreate() { netConnect(ok => { if (ok) netHostRoom(Math.random().toSt
 function netJoin(raw) { const code = String(raw || '').trim().toLowerCase().replace(/[^a-z0-9]/g, ''); if (code.length < 4) return netStatus('Digite o código da sala'); netConnect(ok => { if (ok) netJoinRoom(code); }); }
 function netRemove(id) { const r = NET_R.get(id); if (r) { scene.remove(r.rig.root); NET_R.delete(id); } }
 function netUpdate(dt, t) {
+  const now = performance.now();
   for (const r of NET_R.values()) {
-    const dx = r.tx - r.x, dz = r.tz - r.z, k = Math.min(1, dt * 12), rig = r.rig;
-    r.x += dx * k; r.y += (r.ty - r.y) * k; r.z += dz * k;
-    r.speed = Math.min(12, Math.hypot(dx, dz) / Math.max(dt, 1e-3)); r.phase += r.speed * dt * 1.6;
+    const age = Math.min(0.25, (now - (r.pt || now)) / 1000), rig = r.rig;
+    const gx = r.tx + (r.vx || 0) * age, gz = r.tz + (r.vz || 0) * age, k = Math.min(1, dt * 14);
+    r.x += (gx - r.x) * k; r.y += (r.ty - r.y) * k; r.z += (gz - r.z) * k;
+    const sp = Math.min(12, Math.hypot(r.vx || 0, r.vz || 0)); r.speed += (sp - r.speed) * Math.min(1, dt * 10); r.phase += r.speed * dt * 1.6;
     rig.yaw = (rig.yaw || 0) + angDiff(r.rot, rig.yaw || 0) * Math.min(1, dt * 14);
     rig.root.position.set(r.x, r.y, r.z); rig.root.rotation.y = rig.yaw; rig.root.scale.setScalar(rig.sc);
     applyPose(rig, poseTarget({ emote: r.emote, grounded: r.grounded, vy: r.vy, speed: r.speed, phase: r.phase }, t), dt);
