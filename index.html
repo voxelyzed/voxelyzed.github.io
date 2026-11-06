@@ -246,13 +246,6 @@ body[data-m="studio"][data-gui-mode="1"] #properties .tabs button.active{
       <div><h1>Voxelyzed</h1><p>Jogue, crie e compartilhe mundos 3D com editor de GUI integrado. Ferramentas inspiradas no Roblox Studio.</p></div>
       <div class="row"><button class="pri" data-go="studio">+ Criar jogo</button><button data-go="avatar">Editar avatar</button></div>
     </div>
-    <section style="background:linear-gradient(135deg,#1d2732,#1b1e24);border:1px solid #00a2ff44;border-radius:14px;padding:16px;margin-bottom:22px">
-      <h2 style="margin:0 0 6px;font-size:18px">🌐 Mundos</h2>
-      <p class="hint" style="margin:0 0 12px">Crie um mundo e compartilhe o código. Quem entrar verá os jogos publicados nele e poderá jogar com você. O criador precisa manter o Voxelyzed aberto para hospedar.</p>
-      <div class="row" style="flex-wrap:wrap"><input id="worldNameIn" maxlength="40" placeholder="Nome do seu mundo" style="width:min(220px,100%)"><button class="pri" id="worldCreate">＋ Criar meu mundo</button><input id="worldJoinCode" maxlength="12" placeholder="Código do mundo (até 12 caracteres)" style="width:min(320px,100%);text-transform:uppercase"><button id="worldJoin">Entrar no mundo</button><button id="worldCopy" style="display:none">📋 Copiar código</button></div>
-      <div id="worldStatus" class="hint" style="margin-top:10px"></div>
-      <div id="worldSavedList" style="display:flex;flex-direction:column;gap:6px;margin-top:10px"></div>
-    </section>
     <h2 style="margin:0 0 12px;font-size:18px">🎮 Jogos</h2>
     <div class="grid" id="grid"></div>
     <h2 style="margin:28px 0 10px;font-size:18px">📥 Importar jogo</h2>
@@ -380,7 +373,7 @@ body[data-m="studio"][data-gui-mode="1"] #properties .tabs button.active{
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
 <script>
 const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
@@ -1361,47 +1354,197 @@ function ensureTouchCtrl() {
   look.addEventListener('pointercancel', endLook);
 }
 
-// ===== Mundos multijogador (com avatares) =====
-const NET = { peer: null, conns: [], conn: null, role: 'solo', timer: null }, NET_Q = [], NET_R = new Map();
+// ===== Multijogador online (MQTT em brokers públicos gratuitos: sem conta, sem instalar nada) =====
+// Tenta os servidores da lista em ordem; todos os jogadores acabam no primeiro que estiver no ar.
+const NET_BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt', 'wss://test.mosquitto.org:8081/mqtt'];
+const NET_NS = 'voxelyzed-mp1', NET_MAX = 8;
+const NET = { cli: null, ready: false, connGen: 0, id: '', gk: '', role: 'solo', code: '', hostId: null, gotWorld: false, wc: null, quick: false, onFail: null, gen: 0, tk: 0, timer: null, lastKey: '', lastSend: 0, lastAv: 0, lastN: 0, pend: [], seen: new Map(), rooms: new Map(), admitted: new Set(), sending: new Set(), cmdBuf: [], tried: new Set() }, NET_Q = [], NET_R = new Map();
+const netNewId = () => 'p' + Math.random().toString(36).slice(2, 10);
+NET.id = netNewId();
+const netDec = p => { try { return new TextDecoder().decode(p); } catch (e) { return String(p); } };
 const netStatus = t => { const s = document.getElementById('netStatus'); if (s) s.textContent = t; };
 function netShowPanel(v) { const el = document.getElementById('netPanel'); if (el) el.style.display = v ? 'block' : 'none'; }
-function ensureNetPanel() { if (document.getElementById('netPanel')) return; document.body.insertAdjacentHTML('beforeend', '<div id="netPanel" style="position:fixed;top:70px;right:12px;z-index:50;background:#1b1e24ee;color:#eee;padding:10px;border-radius:10px;display:none"><b>🌐 Mundo</b><div id="netStatus"></div></div>'); }
-function netDisconnect() { try { NET.conns.forEach(c => c.close()); NET.conn?.close(); NET.peer?.destroy(); } catch (e) {} clearNetPlayers();clearInterval(NET.timer); Object.assign(NET, { peer: null, conns: [], conn: null, role: 'solo', timer: null, worldCode: null, worldName: null }); NET_Q.length = 0; }
-function netOpen(peer) { NET.peer = peer; NET.timer = setInterval(() => { if (!NET.peer?.id || !me || view!=='play' || !currentPlay) return; const m = { t: 'pos', id: NET.peer.id, gameId: currentPlay.id || currentPlay.name, x: me.x, y: me.y, z: me.z, rot: me.rot, emote: me.emote, g: me.grounded, vy: me.vy, rag:me.ragdoll>0, rb:me.ragdollState?ragdollSnapshot(me.ragdollState):null, av: state.avatar }; if (NET.role === 'host') NET.conns.forEach(c => c.open && c.gameId===m.gameId && c.send(m)); else NET.conn?.open && NET.conn.send(m); }, 100); }
-function worldCode() { return String(localStorage.bv2_world_code || ''); }
-function accountWorlds() { try { return JSON.parse(localStorage.bv2_worlds||'[]'); } catch { return []; } }
-function rememberWorld(code,role,name='') { code=String(code||'').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,12);if(!code)return;name=String(name||'').trim().slice(0,40);const list=accountWorlds();const found=list.find(w=>w.code===code);if(found){if(found.role!=='owner'&&role)found.role=role;if(name)found.name=name;found.lastUsed=Date.now();}else list.unshift({code,role:role||'joined',name,lastUsed:Date.now()});try{localStorage.bv2_worlds=JSON.stringify(list.slice(0,50));}catch{} }
-function worldCatalog() { const code=NET.worldCode||worldCode();return loadLib().filter(p=>!p.worldCode||p.worldCode===code).map(p => ({ id:p.id, name:p.name, desc:p.desc||'', author:p.author||'Anônimo' })); }
-function showWorldCatalog(items) { let el=document.getElementById('worldCatalog'); if(!el){el=document.createElement('div');el.id='worldCatalog';el.className='modal on';document.body.append(el);} el.innerHTML='<div class="box"><h2></h2><p class="hint">Escolha um jogo publicado para jogar com o criador.</p><div id="worldCatalogList" class="grid"></div><div class="row" style="justify-content:flex-end;margin-top:12px"><button id="worldCatalogClose">Fechar</button></div></div>';el.querySelector('h2').textContent='🌐 '+(NET.worldName||'Jogos deste mundo');const list=el.querySelector('#worldCatalogList'); items.forEach(p=>{const card=document.createElement('div');card.className='card';const title=document.createElement('b');title.textContent=p.name;const desc=document.createElement('p');desc.textContent=p.desc||'Sem descrição';const go=document.createElement('button');go.className='pri';go.textContent='▶ Jogar com o mundo';go.onclick=()=>{NET.conn?.send({t:'select',id:p.id});el.remove();};card.append(title,desc,go);list.append(card);}); el.querySelector('#worldCatalogClose').onclick=()=>el.remove(); }
-function netCreateWorld(code='',name='') { if(NET.role==='host'&&NET.peer&&!NET.peer.destroyed&&code&&NET.worldCode===code){const s=$('#worldStatus');if(s)s.textContent='Seu mundo está online: '+(NET.worldName||NET.worldCode);return;} netDisconnect();if(!code)code=Array.from({length:12},()=> 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'[Math.floor(Math.random()*36)]).join('');name=String(name||$('#worldNameIn')?.value||'').trim().slice(0,40)||'Meu mundo';localStorage.bv2_world_code=code;rememberWorld(code,'owner',name);const peer=new Peer('vx'+code.toLowerCase());netOpen(peer);peer.on('open',()=>{NET.role='host';NET.worldCode=code;NET.worldName=name;const s=$('#worldStatus');if(s)s.textContent='Mundo “'+name+'” online. Código: '+code+' — mantenha esta página aberta para receber jogadores.';const copy=$('#worldCopy');if(copy)copy.style.display='inline-block';if(view==='home')renderHome();});peer.on('error',e=>{const s=$('#worldStatus');if(s)s.textContent=e.type==='unavailable-id'?'Este código já está sendo usado. Crie outro mundo.':'Não foi possível hospedar: '+e.type;});peer.on('connection',c=>{NET.conns.push(c);c.gameId=null;c.on('data',m=>netHost(m,c));c.on('open',()=>c.send({t:'catalog',items:worldCatalog(),worldName:NET.worldName||name}));c.on('close',()=>{NET.conns=NET.conns.filter(x=>x!==c);netRemove(c.peer);});}); }
-function netJoinWorld(raw) { const code=String(raw).toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,12);if(!code)return toast('Digite o código do mundo');netDisconnect();const peer=new Peer();netOpen(peer);peer.on('error',e=>{const s=$('#worldStatus');if(s)s.textContent=e.type==='peer-unavailable'?'Mundo não encontrado. Confira o código e se o criador está online.':'Erro de conexão: '+e.type;});peer.on('open',()=>{const c=peer.connect('vx'+code.toLowerCase());NET.worldCode=code;c.on('open',()=>{NET.conn=c;NET.role='guest';rememberWorld(code,'joined');const s=$('#worldStatus');if(s)s.textContent='Conectado ao mundo '+code+'. Carregando jogos…';if(view==='home')renderHome();});c.on('data',m=>netGuest(m,c));c.on('close',()=>{clearNetPlayers();NET.role='solo';const s=$('#worldStatus');if(s)s.textContent='A conexão com o mundo foi encerrada.';});}); }
-function netGuest(m,c) { if(m.t==='catalog'){NET.worldName=m.worldName||NET.worldName||'';rememberWorld(NET.worldCode,'joined',NET.worldName);showWorldCatalog(m.items||[]);if(view==='home'){renderHome();const s=$('#worldStatus');if(s)s.textContent='Conectado ao mundo “'+(NET.worldName||NET.worldCode)+'” ('+NET.worldCode+').';}}else if(m.t==='world'){Runner.end();playProject(m.p,'world');}else if(m.t==='clearPlayers')clearNetPlayers();else if(m.t==='published')toast(m.ok?'Jogo publicado no mundo!':(m.error||'Não foi possível publicar no mundo.'));else if(m.t==='cmds')applyCmds(m.list.filter(([op])=>op!=='tp'));else if(m.t==='pos')netPos(m,c); }
-function netHost(m,c) { if(m.t==='pos')netPos(m,c);else if(m.t==='touch')NET_Q.push(...m.names);else if(m.t==='click')Runner.clickGUI(m.name);else if(m.t==='publish'){if(m.entry?.worldCode!==(NET.worldCode||worldCode())){c.send({t:'published',ok:false,error:'O jogo foi enviado para outro mundo.'});return;}const lib=loadLib(),i=lib.findIndex(p=>p.id===m.entry.id);if(i>=0)lib[i]=m.entry;else lib.push(m.entry);saveLib(lib);c.send({t:'published',ok:true});}else if(m.t==='select'){const p=loadLib().find(x=>x.id===m.id);if(!p){c.send({t:'catalog',items:worldCatalog()});return;}if(view!=='play'||currentPlay?.id!==p.id)NET.conns.forEach(x=>x.open&&x.send({t:'clearPlayers'}));c.gameId=p.id||p.name;if(view!=='play'||currentPlay?.id!==p.id)playProject(p,'home');c.send({t:'world',p});} }
-function netPos(m, from) {
-  if(view!=='play'||!currentPlay||(currentPlay.id||currentPlay.name)!==m.gameId){netRemove(m.id);return;}
-  if (m.id !== NET.peer.id) {
-    let r = NET_R.get(m.id);
-    if (!r) { r = { rig: buildRig(m.av || state.avatar), x: m.x, y: m.y, z: m.z, speed: 0, phase: 0 }; scene.add(r.rig.root); NET_R.set(m.id, r); }
-    if(m.rag&&!r.ragdoll)r.ragdollState=createRagdollState(r.rig,new THREE.Vector3(m.x,m.y,m.z),m.rot||0,new THREE.Vector3());if(!m.rag&&r.ragdoll){r.ragdollState=null;resetRagdollRig(r.rig,m.rot||0);}if(m.rag&&m.rb)applyRagdollSnapshot(r.ragdollState,m.rb);
-    Object.assign(r, { tx: m.x, ty: m.y, tz: m.z, rot: m.rot || 0, emote: m.emote || 0, grounded: !!m.g, vy: m.vy || 0, ragdoll: !!m.rag });
-  }
-  if (NET.role === 'host') NET.conns.forEach(c => c.open && c !== from && c.gameId===m.gameId && c.send(m));
+function ensureNetPanel() {
+  if (document.getElementById('netPanel')) return;
+  document.body.insertAdjacentHTML('beforeend', '<div id="netPanel" style="position:fixed;top:70px;right:12px;z-index:50;background:#1b1e24ee;color:#eee;padding:10px;border-radius:10px;display:none;font:13px system-ui,sans-serif;max-width:250px"><button id="netQuick">🌐 Jogar online</button> <button id="netLeave">Sair</button><div style="margin-top:6px"><button id="netCreate">Criar sala</button> <input id="netCode" placeholder="CÓDIGO" size="6"> <button id="netJoin">Entrar</button></div><div id="netStatus" style="margin-top:6px"></div></div>');
+  document.getElementById('netQuick').onclick = () => netQuick();
+  document.getElementById('netLeave').onclick = () => { netDisconnect(); netStatus('Offline'); };
+  document.getElementById('netCreate').onclick = () => netCreate();
+  document.getElementById('netJoin').onclick = () => netJoin(document.getElementById('netCode').value);
 }
+function netKey() { return String((typeof currentPlay !== 'undefined' && currentPlay && currentPlay.name) || 'jogo').toLowerCase().normalize('NFD').replace(/[^a-z0-9]/g, '').slice(0, 16) || 'jogo'; }
+// ---- conexão com o broker (com troca automática de servidor) ----
+function netConnect(then) {
+  if (NET.ready && NET.cli) { if (then) then(true); return; }
+  if (NET.cli) { NET.pend.push(then); return; }
+  if (typeof mqtt === 'undefined') { netStatus('A biblioteca online não carregou. Verifique a internet.'); if (then) then(false); return; }
+  NET.id = netNewId(); NET.gk = netKey(); NET.pend = [then]; const gen = ++NET.connGen;
+  const done = ok => { const p = NET.pend.splice(0); p.forEach(f => f && f(ok)); };
+  const attempt = i => {
+    if (NET.connGen !== gen) return;
+    if (i >= NET_BROKERS.length) { NET.cli = null; NET.ready = false; netStatus('Servidores online indisponíveis agora. Tente mais tarde.'); done(false); return; }
+    netStatus('Conectando ao servidor online (' + (i + 1) + '/' + NET_BROKERS.length + ')…');
+    let cli, up = false;
+    try { cli = mqtt.connect(NET_BROKERS[i], { clientId: 'vx_' + NET.id, clean: true, keepalive: 20, connectTimeout: 6000, reconnectPeriod: 0, will: { topic: NET_NS + '/r/' + NET.gk + '/' + NET.id, payload: '', qos: 0, retain: true } }); } catch (e) { attempt(i + 1); return; }
+    NET.cli = cli;
+    cli.on('connect', () => { if (NET.connGen !== gen) { try { cli.end(true); } catch (e) {} return; } up = true; NET.ready = true; cli.subscribe(NET_NS + '/r/' + NET.gk + '/+', { qos: 0 }); done(true); });
+    cli.on('message', (t, pl) => { if (NET.cli === cli) netOnMsg(t, netDec(pl)); });
+    cli.on('error', () => {});
+    cli.on('close', () => {
+      if (NET.connGen !== gen || NET.cli !== cli) return;
+      if (!up) { try { cli.end(true); } catch (e) {} NET.cli = null; attempt(i + 1); }
+      else { NET.ready = false; NET.cli = null; netLeaveRoom(); netStatus('Conexão com o servidor online caiu. Toque em Jogar online de novo.'); }
+    });
+  };
+  attempt(0);
+}
+function netDisconnect() {
+  netLeaveRoom(); NET.connGen++; const cli = NET.cli; NET.cli = null; NET.ready = false; NET.rooms.clear(); NET.pend.length = 0;
+  if (cli) setTimeout(() => { try { cli.end(true); } catch (e) {} }, 250);
+}
+function netPub(topic, obj, retain) { if (!NET.cli || !NET.ready) return; try { NET.cli.publish(topic, obj === '' ? '' : JSON.stringify(obj), { qos: 0, retain: !!retain }); } catch (e) {} }
+function netBc(m, to) { if (!NET.code) return; m.f = NET.id; if (to) m.to = to; if (NET.role === 'host') m.h = 1; netPub(NET_NS + '/m/' + NET.code, m); }
+function netLeaveRoom() {
+  if (NET.code && NET.ready) { netBc({ t: 'bye' }); try { NET.cli.unsubscribe(NET_NS + '/m/' + NET.code); } catch (e) {} if (NET.role === 'host') netPub(NET_NS + '/r/' + NET.gk + '/' + NET.id, '', true); }
+  clearInterval(NET.timer); NET.timer = null; NET.gen++;
+  for (const id of [...NET_R.keys()]) netRemove(id);
+  Object.assign(NET, { role: 'solo', code: '', hostId: null, gotWorld: false, wc: null, quick: false, onFail: null, lastKey: '', lastN: 0 });
+  NET.seen.clear(); NET.admitted.clear(); NET.sending.clear(); NET.cmdBuf.length = 0; NET_Q.length = 0;
+}
+// ---- recepção ----
+function netOnMsg(topic, txt) {
+  if (topic.startsWith(NET_NS + '/r/')) {
+    const id = topic.split('/').pop();
+    if (!txt) NET.rooms.delete(id);
+    else { try { const r = JSON.parse(txt); if (r && typeof r.code === 'string') NET.rooms.set(id, { code: r.code.slice(0, 8), n: +r.n || 1 }); } catch (e) {} }
+    netMerge(); return;
+  }
+  if (!NET.code || topic !== NET_NS + '/m/' + NET.code) return;
+  let m; try { m = JSON.parse(txt); } catch (e) { return; }
+  if (!m || typeof m.f !== 'string' || m.f === NET.id || (m.to && m.to !== NET.id)) return;
+  NET.seen.set(m.f, performance.now());
+  if (m.h && !NET.hostId && NET.role === 'guest') NET.hostId = m.f;
+  netRecv(m);
+}
+function netRecv(m) {
+  if (m.t === 'bye') { netRemove(m.f); NET.seen.delete(m.f); NET.admitted.delete(m.f); if (NET.role === 'guest' && m.f === NET.hostId) { if (NET.gotWorld) netHostLost(); else netJoinFail('A sala fechou'); } return; }
+  if (m.t === 'pos') return netPos(m);
+  if (NET.role === 'host') netHost(m); else if (NET.role === 'guest') netGuest(m);
+}
+function netHost(m) {
+  if (m.t === 'need') {
+    if (!NET.admitted.has(m.f) && NET.admitted.size >= NET_MAX - 1) { netBc({ t: 'full' }, m.f); return; }
+    NET.admitted.add(m.f); netSendWorld(m.f);
+  } else if (!NET.admitted.has(m.f)) return;
+  else if (m.t === 'touch' && Array.isArray(m.names)) NET_Q.push(...m.names.slice(0, 20).map(String));
+  else if (m.t === 'click') Runner.clickGUI(String(m.name));
+}
+function netGuest(m) {
+  if (m.f !== NET.hostId) return;
+  if (m.t === 'full') return netJoinFail('Sala cheia');
+  if (m.t === 'wc') {
+    if (NET.gotWorld) return;
+    if (!NET.wc || NET.wc.k !== m.k) NET.wc = { k: m.k, n: m.n, parts: [], got: 0 };
+    const w = NET.wc; if (w.parts[m.i] === undefined) { w.parts[m.i] = m.d; w.got++; }
+    if (w.got === w.n) {
+      let p; try { p = JSON.parse(w.parts.join('')); } catch (e) { NET.wc = null; return; }
+      NET.gotWorld = true; NET.wc = null; NET.onFail = null; Runner.end();
+      playProject({ name: p.name, world: p.world, gui: p.gui, script: '' }, 'net'); netStatusLine();
+    }
+  } else if (m.t === 'cmds' && NET.gotWorld && Array.isArray(m.list)) applyCmds(m.list.filter(([op]) => op !== 'tp'));
+}
+async function netSendWorld(to) {
+  if (!currentPlay || NET.sending.has(to)) return; NET.sending.add(to);
+  try {
+    const s = JSON.stringify({ name: currentPlay.name, world: snapWorld(), gui: currentPlay.gui || [] }), SZ = 20000, n = Math.max(1, Math.ceil(s.length / SZ)), k = Math.random().toString(36).slice(2, 7);
+    for (let i = 0; i < n; i++) { if (NET.role !== 'host') break; netBc({ t: 'wc', k, i, n, d: s.slice(i * SZ, (i + 1) * SZ) }, to); await new Promise(r => setTimeout(r, 100)); }
+  } finally { NET.sending.delete(to); }
+}
+function netPos(m) {
+  const id = m.f; if (NET.role === 'guest' && !NET.gotWorld) return;
+  if (![m.x, m.y, m.z].every(Number.isFinite)) return;
+  let r = NET_R.get(id);
+  if (!r) { if (!m.av) return; r = { rig: buildRig(m.av), x: m.x, y: m.y, z: m.z, speed: 0, phase: 0 }; scene.add(r.rig.root); NET_R.set(id, r); }
+  Object.assign(r, { tx: m.x, ty: m.y, tz: m.z, rot: m.rot || 0, emote: m.emote || 0, grounded: !!m.g, vy: m.vy || 0 });
+}
+// ---- salas ----
+function netStatusLine() { if (!NET.code) return; netStatus((NET.role === 'host' ? 'Anfitrião · sala ' : 'Online · sala ') + NET.code.toUpperCase() + ' · ' + (1 + NET.seen.size) + '/' + NET_MAX + ' jogadores'); }
+function netStartTimers() { clearInterval(NET.timer); NET.tk = 0; NET.timer = setInterval(() => { NET.tk++; netTick(); if (NET.tk % 8 === 0) netSweep(); }, 125); }
+function netTick() {
+  if (!NET.code) return;
+  if (NET.role === 'host' && NET.cmdBuf.length) { if (NET.cmdBuf.length > 4000) NET.cmdBuf.splice(0, NET.cmdBuf.length - 4000); netBc({ t: 'cmds', list: NET.cmdBuf.splice(0, 400) }); }
+  if (!me || (NET.role === 'guest' && !NET.gotWorld)) return;
+  const now = performance.now(), r = v => Math.round(v * 100) / 100;
+  const m = { t: 'pos', x: r(me.x), y: r(me.y), z: r(me.z), rot: r(me.rot || 0), emote: me.emote, g: me.grounded, vy: r(me.vy || 0) };
+  const k = [m.x, m.y, m.z, m.rot, m.emote, m.g].join(), needAv = now - NET.lastAv > 3000;
+  if (k === NET.lastKey && now - NET.lastSend < 1000 && !needAv) return;
+  NET.lastKey = k; NET.lastSend = now; if (needAv) { m.av = state.avatar; NET.lastAv = now; }
+  netBc(m);
+}
+function netSweep() {
+  const now = performance.now();
+  for (const [id, t] of [...NET.seen]) if (now - t > 7000) { NET.seen.delete(id); NET.admitted.delete(id); netRemove(id); }
+  if (NET.role === 'guest' && NET.gotWorld && NET.hostId && !NET.seen.has(NET.hostId)) { netHostLost(); return; }
+  if (NET.role === 'host') { netBc({ t: 'hb' }); const n = 1 + NET.seen.size; if (n !== NET.lastN) { NET.lastN = n; netListRoom(); } }
+  if (NET.role === 'host' || NET.gotWorld) netStatusLine();
+}
+function netHostLost() { netLeaveRoom(); netStatus('O anfitrião saiu da sala'); }
+function netJoinFail(msg) { const cb = NET.onFail; netLeaveRoom(); netStatus(msg); if (cb) cb(msg); }
+function netListRoom() { if (NET.role === 'host' && NET.listed) netPub(NET_NS + '/r/' + NET.gk + '/' + NET.id, { code: NET.code, n: NET.lastN || 1 }, true); }
+function netHostRoom(code, listed) {
+  netConnect(ok => {
+    if (!ok) return; netLeaveRoom(); NET.role = 'host'; NET.code = code; NET.listed = listed; NET.quick = listed; NET.lastN = 1;
+    NET.cli.subscribe(NET_NS + '/m/' + code, { qos: 0 }); netStartTimers(); netListRoom(); netBc({ t: 'hb' }); netStatusLine();
+  });
+}
+function netJoinRoom(code, onFail) {
+  netConnect(ok => {
+    if (!ok) return; netLeaveRoom(); NET.role = 'guest'; NET.code = code; NET.onFail = onFail || null; const my = ++NET.gen;
+    NET.cli.subscribe(NET_NS + '/m/' + code, { qos: 0 }); netStartTimers(); netStatus('Entrando na sala ' + code.toUpperCase() + '…');
+    let n = 0;
+    const ask = () => {
+      if (NET.gen !== my || NET.role !== 'guest' || NET.gotWorld) return;
+      if (!NET.hostId && n >= 2) return netJoinFail('Sala não encontrada');
+      if (n++ > 8) return netJoinFail('Sem resposta do anfitrião');
+      netBc({ t: 'need' }, NET.hostId || undefined); setTimeout(ask, 2000);
+    };
+    setTimeout(ask, 500);
+  });
+}
+const netOpenRooms = () => [...NET.rooms.entries()].filter(([id]) => id !== NET.id).map(([, r]) => r);
+// Duas pessoas que abrem salas ao mesmo tempo: a sala de menor código vence e a outra (se ainda vazia) entra nela.
+function netMerge() {
+  if (NET.role !== 'host' || !NET.quick || NET.admitted.size > 0) return;
+  const best = netOpenRooms().filter(r => r.n < NET_MAX && r.code < NET.code).sort((a, b) => (a.code < b.code ? -1 : 1))[0];
+  if (best) { NET.tried.add(best.code); netJoinRoom(best.code, () => setTimeout(netQuickNext, 100)); }
+}
+function netQuick() {
+  netDisconnect(); netStatus('Conectando…');
+  netConnect(ok => { if (!ok) return; NET.tried = new Set(); netStatus('Procurando sala online…'); setTimeout(netQuickNext, 1500); });
+}
+function netQuickNext() {
+  if (!NET.ready || NET.role !== 'solo') return;
+  const r = netOpenRooms().filter(x => x.n < NET_MAX && !NET.tried.has(x.code))[0];
+  if (r) { NET.tried.add(r.code); netJoinRoom(r.code, () => setTimeout(netQuickNext, 100)); return; }
+  netHostRoom(Math.random().toString(36).slice(2, 7).padEnd(5, '0'), true);
+}
+function netCreate() { netConnect(ok => { if (ok) netHostRoom(Math.random().toString(36).slice(2, 7).padEnd(5, '0'), false); }); }
+function netJoin(raw) { const code = String(raw || '').trim().toLowerCase().replace(/[^a-z0-9]/g, ''); if (code.length < 4) return netStatus('Digite o código da sala'); netConnect(ok => { if (ok) netJoinRoom(code); }); }
 function netRemove(id) { const r = NET_R.get(id); if (r) { scene.remove(r.rig.root); NET_R.delete(id); } }
-function clearNetPlayers() { for(const id of [...NET_R.keys()])netRemove(id); }
 function netUpdate(dt, t) {
   for (const r of NET_R.values()) {
     const dx = r.tx - r.x, dz = r.tz - r.z, k = Math.min(1, dt * 12), rig = r.rig;
     r.x += dx * k; r.y += (r.ty - r.y) * k; r.z += dz * k;
     r.speed = Math.min(12, Math.hypot(dx, dz) / Math.max(dt, 1e-3)); r.phase += r.speed * dt * 1.6;
     rig.yaw = (rig.yaw || 0) + angDiff(r.rot, rig.yaw || 0) * Math.min(1, dt * 14);
-    if(r.ragdollState){stepRagdollPhysics(r.ragdollState,dt);placeRagdollRig(rig,r.ragdollState);}else{rig.root.position.set(r.x,r.y,r.z);rig.root.rotation.y=rig.yaw;rig.root.scale.setScalar(rig.sc);applyPose(rig,poseTarget({emote:r.emote,grounded:r.grounded,vy:r.vy,speed:r.speed,phase:r.phase},t),dt);}
+    rig.root.position.set(r.x, r.y, r.z); rig.root.rotation.y = rig.yaw; rig.root.scale.setScalar(rig.sc);
+    applyPose(rig, poseTarget({ emote: r.emote, grounded: r.grounded, vy: r.vy, speed: r.speed, phase: r.phase }, t), dt);
   }
 }
 function netDrainTouches() { return NET_Q.splice(0); }
-function netSendTouches(touched) { if (NET.role === 'guest' && NET.conn && touched.length) NET.conn.send({ t: 'touch', names: touched }); }
-function netClick(name) { if (NET.role === 'guest') NET.conn?.send({ t: 'click', name }); else Runner.clickGUI(name); }
-function netSend(list) { if (NET.role === 'host' && list.length) NET.conns.forEach(c => c.open && c.gameId===(currentPlay?.id||currentPlay?.name) && c.send({ t: 'cmds', list })); }
+function netSendTouches(touched) { if (NET.role === 'guest' && NET.gotWorld && touched.length) netBc({ t: 'touch', names: touched }, NET.hostId || undefined); }
+function netClick(name) { if (NET.role === 'guest') netBc({ t: 'click', name }, NET.hostId || undefined); else Runner.clickGUI(name); }
+function netSend(list) { if (NET.role === 'host' && list.length) NET.cmdBuf.push(...list); }
 // ===== Temas de blocos (10 temas x 20 blocos) =====
 // Cada entrada: [rótulo, parâmetros, código]. Parâmetros: nome:tipo:padrão
 // Tipos: t=peça, n=número, s=texto, v=variável, g=GUI, c=cor, e=eixo(x,y,z), o=operador(>,<,>=,<=,==,!=)
@@ -1511,11 +1654,6 @@ const BLK_THEMES = {
     ['voltar ao ponto salvo se cair abaixo de y [n]', 'n:n:-5', 'if (player.y < {n} && __F.cp) player.teleport(__F.cp[0], __F.cp[1], __F.cp[2]);'],
   ]},
   vr: { name: 'Variáveis', color: '#43a047', blocks: [
-    ['valor de [var]', 'var:v:my variable', '(__V[{var}] ?? 0)', 'reporter'],
-    ['criar variável [var]', 'var:v:my variable', '__V[{var}] ??= 0;'],
-    ['variável [var] é verdadeira?', 'var:v:ativo', '!!__V[{var}]', 'boolean'],
-    ['mostrar variável [var] na GUI [g]', 'var:v:pontos,g:g:CoinLabel', 'gui.setText({g}, String(__V[{var}] ?? 0)); gui.setVisible({g}, true);'],
-    ['esconder variável na GUI [g]', 'g:g:CoinLabel', 'gui.setVisible({g}, false);'],
     ['definir [var] como [n]', 'var:v:pontos,n:n:0', '__V[{var}] = {n};'],
     ['somar [n] em [var]', 'var:v:pontos,n:n:1', '__V[{var}] = (__V[{var}] || 0) + {n};'],
     ['subtrair [n] de [var]', 'var:v:pontos,n:n:1', '__V[{var}] = (__V[{var}] || 0) - {n};'],
@@ -1538,8 +1676,6 @@ const BLK_THEMES = {
     ['negativo de [var]', 'var:v:pontos', '__V[{var}] = -(__V[{var}] || 0);'],
   ]},
   tx: { name: 'Texto', color: '#00897b', blocks: [
-    ['juntar [texto] e [texto2]', 'texto:s:Olá ,texto2:s:mundo', '(String({texto}) + String({texto2}))', 'reporter'],
-    ['tamanho de [texto]', 'texto:s:Voxelyzed', 'String({texto}).length', 'reporter'],
     ['juntar [texto] e [texto2] em [var]', 'texto:s:Olá ,texto2:s:mundo,var:v:frase', '__V[{var}] = String({texto}) + String({texto2});'],
     ['[var] em maiúsculas', 'var:v:frase', '__V[{var}] = String(__V[{var}] ?? "").toUpperCase();'],
     ['[var] em minúsculas', 'var:v:frase', '__V[{var}] = String(__V[{var}] ?? "").toLowerCase();'],
@@ -1628,8 +1764,6 @@ const BLK_THEMES = {
     ['desligar relógio de [var]', 'var:v:tempo', '__V[{var}] = __V[{var}] || 0; __F["stop" + {var}] = 1;'],
   ]},
   rg: { name: 'Regras', color: '#c0ca33', blocks: [
-    ['variável [var] maior que [n]?', 'var:v:pontos,n:n:0', 'Number(__V[{var}] ?? 0) > {n}', 'boolean'],
-    ['parar a pilha se [condição]', 'condição:n:n:1', 'if ({condição}) return;'],
     ['pontuar [n]', 'n:n:1', '__V.pontos = (__V.pontos || 0) + {n};'],
     ['perder [n] pontos', 'n:n:1', '__V.pontos = (__V.pontos || 0) - {n};'],
     ['zerar pontos', '', '__V.pontos = 0;'],
@@ -1652,9 +1786,6 @@ const BLK_THEMES = {
     ['penalidade de [n] se jogador cair', 'n:n:1', 'if (player.y < -5) __V.pontos = (__V.pontos || 0) - {n};'],
   ]},
   mt: { name: 'Matemática', color: '#00acc1', blocks: [
-    ['[n] mais [m]', 'n:n:1,m:n:1', '({n} + {m})', 'reporter'],
-    ['[n] vezes [m]', 'n:n:2,m:n:3', '({n} * {m})', 'reporter'],
-    ['raiz quadrada de [n]', 'n:n:9', 'Math.sqrt(Math.max(0, {n}))', 'reporter'],
     ['seno de [v] em [v2]', 'v:v:x,v2:v:y', '__V[{v2}] = Math.sin(__V[{v}] || 0);'],
     ['cosseno de [v] em [v2]', 'v:v:x,v2:v:y', '__V[{v2}] = Math.cos(__V[{v}] || 0);'],
     ['tangente de [v] em [v2]', 'v:v:x,v2:v:y', '__V[{v2}] = Math.tan(__V[{v}] || 0);'],
@@ -1709,9 +1840,6 @@ const BLK_THEMES = {
     ['a cada quadro, para cada item da lista [v]', 'v:v:lista', 'game.onTick(dt => { for (const __it of (__V[{v}] || [])) { __V.item = __it;\n{B}\n} });', 'hat'],
   ]},
   sn: { name: 'Sensores', color: '#3949ab', blocks: [
-    ['posição x do jogador', '', 'player.x', 'reporter'],
-    ['posição y do jogador', '', 'player.y', 'reporter'],
-    ['posição z do jogador', '', 'player.z', 'reporter'],
     ['quando jogador estiver a menos de [n] de x [x] z [z]', 'n:n:3,x:n:0,z:n:0', 'game.onTick(dt => { if (!__F[{ID}] && Math.hypot(player.x - {x}, player.z - {z}) < {n}) { __F[{ID}] = 1;\n{B}\n} });', 'hat'],
     ['enquanto jogador estiver a menos de [n] de x [x] z [z]', 'n:n:3,x:n:0,z:n:0', 'game.onTick(dt => { if (Math.hypot(player.x - {x}, player.z - {z}) < {n}) {\n{B}\n} });', 'hat'],
     ['distância do jogador a x [x] z [z] em [v]', 'x:n:0,z:n:0,v:v:distancia', '__V[{v}] = Math.hypot(player.x - {x}, player.z - {z});'],
@@ -2093,13 +2221,6 @@ BLK_THEMES.anim = { name: '🎬 Animações', color: '#9353d3', blocks: [
  ['continuar animação do player', '', 'player.resumeAnimation();'],
  ['velocidade da animação do player [n]', 'n:n:1', 'player.animationSpeed({n});'],
 ]};
-BLK_THEMES.rag = { name: '🦴 Ragdoll', color: '#8d6e63', blocks: [
- ['derrubar o jogador por [n] segundos', 'n:n:2', 'player.ragdoll({n});'],
- ['derrubar o jogador ao tocar em [alvo]', 'alvo:t:este', 'game.onTouch({alvo}, () => player.ragdoll(2));', 'hat'],
- ['derrubar o jogador quando começar o jogo', '', 'game.onStart(() => player.ragdoll(2));', 'hat'],
- ['levantar o jogador', '', 'player.standUp();'],
- ['levantar o jogador depois de [n] segundos', 'n:n:2', 'game.onTick(dt => { __T[{ID}] = (__T[{ID}] || 0) + dt; if (__T[{ID}] >= {n}) { player.standUp(); __T[{ID}] = -1e9; } });', 'hat'],
-]};
 const BLK_DEF = {};
 for (const [tk, th] of Object.entries(BLK_THEMES)) {
   th.blocks.forEach((row, i) => {
@@ -2108,7 +2229,7 @@ for (const [tk, th] of Object.entries(BLK_THEMES)) {
       const [k, type, d = ''] = s.split(':');
       return { k, type, d: type === 'n' ? Number(d) : d };
     }) : [];
-    BLK_DEF[tk + ':' + i] = { theme: tk, label, params, code, hat: kind === 'hat', reporter: kind === 'reporter' || kind === 'boolean', shape: kind === 'reporter' ? 'reporter' : kind === 'boolean' ? 'boolean' : 'stack' };
+    BLK_DEF[tk + ':' + i] = { theme: tk, label, params, code, hat: kind === 'hat' };
   });
 }
 let beState = null, beTheme = 'ev';
@@ -2159,34 +2280,27 @@ function renderBlockPalette() {
     tabs.append(bt);
   }
   pal.append(tabs);
-  if(beTheme==='vr'){
-    const make=document.createElement('button');make.textContent='＋ Criar variável';make.className='good';make.style.cssText='width:100%;margin:2px 0 8px';
-    make.onclick=()=>{const name=prompt('Nome da variável:','minha variável');if(name===null||!name.trim())return;const i=BLK_THEMES.vr.blocks.findIndex(r=>r[0]==='criar variável [var]');if(i<0)return;addBlockToEditor('vr:'+i);const stack=beState.b.code[beState.active],block=stack[stack.length-1];block.p.var=name.trim().slice(0,40);renderBlockWorkspace();};pal.append(make);
-  }
   const th = BLK_THEMES[beTheme];
   th.blocks.forEach((row, i) => {
     const id = beTheme + ':' + i;
     const el = document.createElement('div');
     el.textContent = row[0].replace(/\[\w+\]/g, '…');
     el.draggable = true;
-    el.title = BLK_DEF[id]?.reporter?'Arraste o bloco arredondado para um campo numérico ou de texto':'Clique para adicionar ou arraste para uma pilha';
-    el.style.cssText = blkStyle(th.color, row[3] === 'hat', BLK_DEF[id]?.shape) + 'margin:4px 0;cursor:grab';
+    el.title = 'Clique para adicionar ou arraste para uma pilha';
+    el.style.cssText = blkStyle(th.color, row[3] === 'hat') + 'margin:4px 0;cursor:grab';
     el.ondragstart = e => e.dataTransfer.setData('text/plain', 'new:' + id);
     el.onclick = () => addBlockToEditor(id);
     pal.append(el);
   });
 }
 // Estilo parecido com o Scratch: cantos arredondados, sombra inferior e topo arredondado nos eventos
-function blkStyle(color, hat, shape='stack') {
-  const radius=shape==='reporter'?'999px':hat?'20px 20px 8px 8px':'10px';
-  const clip=shape==='boolean'?'clip-path:polygon(8% 0,92% 0,100% 50%,92% 100%,8% 100%,0 50%);':'';
-  return `background:${color};color:#fff;font-weight:600;font-size:13px;padding:${shape==='reporter'?'7px 16px':'7px 10px'};` +
-    `border-radius:${radius};${clip}box-shadow:inset 0 -4px rgba(0,0,0,.22);` +
+function blkStyle(color, hat) {
+  return `background:${color};color:#fff;font-weight:600;font-size:13px;padding:7px 10px;` +
+    `border-radius:${hat ? '20px 20px 8px 8px' : '10px'};box-shadow:inset 0 -4px rgba(0,0,0,.22);` +
     'display:flex;align-items:center;gap:6px;flex-wrap:wrap;box-sizing:border-box;';
 }
 function addBlockToEditor(id) {
   const { b } = beState, def = BLK_DEF[id];
-  if(def.reporter){toast('Arraste este bloco arredondado para um campo numérico ou de texto.');return;}
   const p = {};
   def.params.forEach(x => p[x.k] = x.type === 'a' ? (draftAnimations[0]?.id || '') : x.d);
   if (def.hat || beState.active < 0) { b.code.push([{ t: id, p }]); beState.active = b.code.length - 1; }
@@ -2203,7 +2317,6 @@ function beDrop(e, si, idx) {
   let block;
   if (raw.startsWith('new:')) {
     const id = raw.slice(4), def = BLK_DEF[id], p = {};
-    if(def.reporter){toast('Solte o bloco arredondado dentro de um campo numérico ou de texto.');return;}
     def.params.forEach(x => p[x.k] = x.type === 'a' ? (draftAnimations[0]?.id || '') : x.d);
     block = { t: id, p };
   } else {
@@ -2260,7 +2373,7 @@ function renderBlockWorkspace() {
       const row = document.createElement('div');
       row.dataset.row = '1';
       const color = def ? BLK_THEMES[def.theme].color : '#555';
-      row.style.cssText = blkStyle(color, def && def.hat, def?.shape);
+      row.style.cssText = blkStyle(color, def && def.hat);
       const grip = document.createElement('span');
       grip.textContent = '⠿';
       grip.draggable = true;
@@ -2294,14 +2407,7 @@ function renderBlockWorkspace() {
 function beField(blk, prm) {
   let el;
   const val = blk.p[prm.k] ?? prm.d;
-  if(val&&typeof val==='object'&&val.__reporter){
-    const def=BLK_DEF[val.__reporter],nameParam=def?.params.find(x=>x.type==='v');
-    el=document.createElement('button');el.type='button';el.textContent='◉ '+(def?def.label.replace(/\[(\w+)\]/g,(_,k)=>String(val.p?.[k]??'…')):'bloco valor');
-    el.style.cssText=`border:0;background:${def?BLK_THEMES[def.theme].color:'#43a047'};color:#fff;border-radius:999px;padding:5px 11px;font:600 12px system-ui;cursor:pointer;`;
-    el.title='Clique para trocar o nome da variável usada por este bloco';
-    el.onclick=e=>{e.stopPropagation();if(nameParam){const next=prompt('Nome da variável:',val.p?.[nameParam.k]||nameParam.d);if(next!==null){val.p[nameParam.k]=next.trim()||nameParam.d;renderBlockWorkspace();}}};
-    return el;
-  } else if (prm.type === 't' || prm.type === 'e' || prm.type === 'o') {
+  if (prm.type === 't' || prm.type === 'e' || prm.type === 'o') {
     el = document.createElement('select');
     const opts = prm.type === 't' ? beTargets() : prm.type === 'e' ? ['x', 'y', 'z'] : ['>', '<', '>=', '<='];
     opts.forEach(v => {
@@ -2331,11 +2437,6 @@ function beField(blk, prm) {
     el.style.width = prm.type === 'n' ? '70px' : '120px';
     el.oninput = () => { blk.p[prm.k] = prm.type === 'n' ? (Number(el.value) || 0) : el.value; };
   }
-  if(prm.type==='n'||prm.type==='s'){
-    el.title='Você também pode encaixar aqui um bloco arredondado da paleta';
-    el.ondragover=e=>{e.preventDefault();};
-    el.ondrop=e=>{e.preventDefault();e.stopPropagation();const raw=e.dataTransfer.getData('text/plain');if(!raw.startsWith('new:'))return;const id=raw.slice(4),def=BLK_DEF[id];if(!def?.reporter)return;const p={};def.params.forEach(x=>p[x.k]=x.d);blk.p[prm.k]={__reporter:id,p};renderBlockWorkspace();};
-  }
   el.onclick = e => e.stopPropagation();
   return el;
 }
@@ -2343,7 +2444,6 @@ function beField(blk, prm) {
 // ----- Compilação: blocos -> JavaScript que roda no runtime -----
 const blkResolve = (v, self) => (!v || v === 'este') ? self : v;
 function blkLiteral(prm, v, self) {
-  if(v&&typeof v==='object'&&v.__reporter){const def=BLK_DEF[v.__reporter];if(def?.reporter)return blkFill(def.code,blkLits(def,v.p||{},self),'expr','');return '0';}
   switch (prm.type) {
     case 'n': return String(Number(v) || 0);
     case 't': return JSON.stringify(blkResolve(v, self));
@@ -2519,7 +2619,7 @@ function buildRig(av) {
   for (const child of [...root.children]) motion.add(child);
   root.add(motion);
   const rest = Object.fromEntries(Object.entries({upper,head,shL,shR,hpL,hpR}).map(([key,node])=>[key,node.position.clone()]));
-  return { root, motion, rest, upper, head, shL, shR, hpL, hpR, L,T,TW,TD,HS,AW,sc, yaw: 0, cur: Object.fromEntries(POSE_KEYS.map(k => [k, 0])) };
+  return { root, motion, rest, upper, head, shL, shR, hpL, hpR, L, sc, yaw: 0, cur: Object.fromEntries(POSE_KEYS.map(k => [k, 0])) };
 }
 const POSE_KEYS = Object.keys(ANIM_CHANNELS);
 function poseTarget(s, t) {
@@ -2534,47 +2634,6 @@ function poseTarget(s, t) {
   else if (s.speed > .4) { const k = clamp(s.speed / 11, .25, 1), sw = Math.sin(s.phase); p.lLx = sw * 1.0 * k; p.lRx = -sw * 1.0 * k; p.aLx = -sw * 1.05 * k; p.aRx = sw * 1.05 * k; p.uy = Math.abs(Math.cos(s.phase)) * .13 * k; p.lean = .05 + .13 * k; p.aLz = .06; p.aRz = -.06; }
   return p;
 }
-function createRagdollState(rig,base=new THREE.Vector3(me.x,me.y,me.z),yaw=me.rot,velocity=null){
-  const s=rig.sc,L=rig.L*s,T=rig.T*s,TW=rig.TW*s,TD=rig.TD*s,HS=rig.HS*s,AW=rig.AW*s,armLen=T,legLen=L,q=new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0),yaw),v=velocity||new THREE.Vector3(Math.sin(yaw)*me.speed,me.vy,Math.cos(yaw)*me.speed);
-  const pos=(x,y,z)=>base.clone().add(new THREE.Vector3(x,y,z).applyQuaternion(q));
-  const body=(name,mass,x,y,z,r,halfLen,initial)=>({name,mass,invMass:1/mass,invI:1/Math.max(.01,mass*r*r*.4),pos:initial?.pos||pos(x,y,z),q:initial?.q||q.clone(),vel:v.clone(),omega:new THREE.Vector3((Math.random()-.5)*1.2,(Math.random()-.5)*1.2,(Math.random()-.5)*1.2),r,halfLen,targetPos:null,targetQ:null});
-  let initial=null;if(rig?.root){rig.root.updateMatrixWorld(true);const pose=(group,offset)=>({pos:offset?group.localToWorld(offset):group.getWorldPosition(new THREE.Vector3()),q:group.getWorldQuaternion(new THREE.Quaternion())}),torso=pose(rig.upper,new THREE.Vector3(0,rig.T/2,0)),head=pose(rig.head),armL=pose(rig.shL),armR=pose(rig.shR),legL=pose(rig.hpL),legR=pose(rig.hpR);armL.pos.add(new THREE.Vector3(0,-armLen/2,0).applyQuaternion(armL.q));armR.pos.add(new THREE.Vector3(0,-armLen/2,0).applyQuaternion(armR.q));legL.pos.add(new THREE.Vector3(0,-legLen/2,0).applyQuaternion(legL.q));legR.pos.add(new THREE.Vector3(0,-legLen/2,0).applyQuaternion(legR.q));initial={torso,head,armL,armR,legL,legR};}
-  const bodies={
-    torso:body('torso',5,0,L+T/2,0,Math.max(TW,TD)*.43,Math.max(0,T/2-Math.max(TW,TD)*.43),initial?.torso),
-    head:body('head',1,0,L+T+HS/2,0,HS*.48,0,initial?.head),
-    armL:body('armL',.8,-(TW+AW)/2,L+T/2,0,AW*.48,Math.max(0,armLen/2-AW*.48),initial?.armL),
-    armR:body('armR',.8,(TW+AW)/2,L+T/2,0,AW*.48,Math.max(0,armLen/2-AW*.48),initial?.armR),
-    legL:body('legL',2,-TW/4,L/2,0,Math.max(TW*.22,TD*.34),Math.max(0,legLen/2-Math.max(TW*.22,TD*.34)),initial?.legL),
-    legR:body('legR',2,TW/4,L/2,0,Math.max(TW*.22,TD*.34),Math.max(0,legLen/2-Math.max(TW*.22,TD*.34)),initial?.legR)
-  };
-  const joint=(a,b,pa,pb)=>({a,b,pa:new THREE.Vector3(...pa),pb:new THREE.Vector3(...pb)}),shoulderY=T/2-.1*s;
-  const joints=[joint('torso','head',[0,T/2,0],[0,-HS/2,0]),joint('torso','armL',[-TW/2,shoulderY,0],[0,armLen/2,0]),joint('torso','armR',[TW/2,shoulderY,0],[0,armLen/2,0]),joint('torso','legL',[-TW/4,-T/2,0],[0,legLen/2,0]),joint('torso','legR',[TW/4,-T/2,0],[0,legLen/2,0])];
-  return{rig,bodies,joints,L,T,TW,TD,HS,AW,armLen,legLen,elapsed:0,grounded:false,hit:false};
-}
-function ragdollSnapshot(state){if(!state)return null;const out={};for(const [name,b] of Object.entries(state.bodies))out[name]=[b.pos.x,b.pos.y,b.pos.z,b.q.x,b.q.y,b.q.z,b.q.w];return out;}
-function applyRagdollSnapshot(state,snapshot){if(!state||!snapshot)return;for(const [name,a] of Object.entries(snapshot)){const b=state.bodies[name];if(!b||!Array.isArray(a))continue;b.targetPos=new THREE.Vector3(a[0],a[1],a[2]);b.targetQ=new THREE.Quaternion(a[3],a[4],a[5],a[6]).normalize();}}
-function collideRagdollBody(b,solids,dt){
-  const axis=new THREE.Vector3(0,1,0).applyQuaternion(b.q),extent=new THREE.Vector3(Math.abs(axis.x)*b.halfLen+b.r,Math.abs(axis.y)*b.halfLen+b.r,Math.abs(axis.z)*b.halfLen+b.r),lo=b.pos.clone().sub(extent),hi=b.pos.clone().add(extent);
-  for(const box of solids){const bb=box.a;if(hi.x<bb.x||lo.x>bb.x+bb.w||hi.y<bb.y||lo.y>bb.y+bb.h||hi.z<bb.z||lo.z>bb.z+bb.d)continue;
-    for(let i=0;i<5;i++){const along=b.halfLen*(i/2-1),sample=b.pos.clone().addScaledVector(axis,along),closest=new THREE.Vector3(clamp(sample.x,bb.x,bb.x+bb.w),clamp(sample.y,bb.y,bb.y+bb.h),clamp(sample.z,bb.z,bb.z+bb.d)),delta=sample.clone().sub(closest),dist=delta.length();if(dist>=b.r)continue;
-      let normal;if(dist>.0001)normal=delta.multiplyScalar(1/dist);else{const faces=[[Math.abs(sample.x-bb.x),-1,0,0],[Math.abs(bb.x+bb.w-sample.x),1,0,0],[Math.abs(sample.y-bb.y),0,-1,0],[Math.abs(bb.y+bb.h-sample.y),0,1,0],[Math.abs(sample.z-bb.z),0,0,-1],[Math.abs(bb.z+bb.d-sample.z),0,0,1]].sort((a,b)=>a[0]-b[0])[0];normal=new THREE.Vector3(faces[1],faces[2],faces[3]);}
-      const penetration=Math.min(.28,b.r-dist);b.pos.addScaledVector(normal,penetration*.72);const arm=sample.clone().sub(b.pos),contactVel=b.vel.clone().add(new THREE.Vector3().crossVectors(b.omega,arm)),vn=contactVel.dot(normal);if(vn<0){const impulse=-(1+.12)*vn*b.mass;b.vel.addScaledVector(normal,impulse*b.invMass);b.omega.addScaledVector(new THREE.Vector3().crossVectors(arm,normal),impulse*b.invI);const tangent=b.vel.clone().addScaledVector(normal,-b.vel.dot(normal));b.vel.addScaledVector(tangent,-Math.min(.22,tangent.length()*.12));}b.hit=true;break;
-    }
-  }
-}
-function closestCapsuleAxis(a,b){const ua=new THREE.Vector3(0,1,0).applyQuaternion(a.q),ub=new THREE.Vector3(0,1,0).applyQuaternion(b.q),p1=a.pos.clone().addScaledVector(ua,-a.halfLen),q1=a.pos.clone().addScaledVector(ua,a.halfLen),p2=b.pos.clone().addScaledVector(ub,-b.halfLen),q2=b.pos.clone().addScaledVector(ub,b.halfLen),d1=q1.clone().sub(p1),d2=q2.clone().sub(p2),r=p1.clone().sub(p2),aa=d1.dot(d1),ee=d2.dot(d2),ff=d2.dot(r);let s=0,t=0;if(aa<=1e-8&&ee<=1e-8)return[p1,p2];if(aa<=1e-8)t=clamp(ff/ee,0,1);else{const cc=d1.dot(r);if(ee<=1e-8)s=clamp(-cc/aa,0,1);else{const bb=d1.dot(d2),den=aa*ee-bb*bb;s=den?clamp((bb*ff-cc*ee)/den,0,1):0;t=(bb*s+ff)/ee;if(t<0){t=0;s=clamp(-cc/aa,0,1);}else if(t>1){t=1;s=clamp((bb-cc)/aa,0,1);}}}return[p1.addScaledVector(d1,s),p2.addScaledVector(d2,t)];}
-function collideRagdollPairs(state){const bodies=Object.values(state.bodies),linked=new Set(state.joints.map(j=>[j.a,j.b].sort().join(':')));for(let i=0;i<bodies.length;i++)for(let k=i+1;k<bodies.length;k++){const a=bodies[i],b=bodies[k];if(linked.has([a.name,b.name].sort().join(':')))continue;const [pa,pb]=closestCapsuleAxis(a,b),delta=pb.clone().sub(pa),dist=delta.length(),sum=a.r+b.r;if(dist>=sum)continue;const n=dist>.0001?delta.multiplyScalar(1/dist):new THREE.Vector3(1,0,0),total=a.invMass+b.invMass,depth=Math.min(.25,sum-dist);a.pos.addScaledVector(n,-depth*a.invMass/total*.7);b.pos.addScaledVector(n,depth*b.invMass/total*.7);const ra=pa.sub(a.pos),rb=pb.sub(b.pos),va=a.vel.clone().add(new THREE.Vector3().crossVectors(a.omega,ra)),vb=b.vel.clone().add(new THREE.Vector3().crossVectors(b.omega,rb)),vn=vb.sub(va).dot(n);if(vn<0){const impulse=-(1+.08)*vn/total;a.vel.addScaledVector(n,-impulse*a.invMass);b.vel.addScaledVector(n,impulse*b.invMass);a.omega.addScaledVector(new THREE.Vector3().crossVectors(ra,n),-impulse*a.invI);b.omega.addScaledVector(new THREE.Vector3().crossVectors(rb,n),impulse*b.invI);}}}
-function solveRagdollJoint(state,j,dt){const a=state.bodies[j.a],b=state.bodies[j.b],wa=j.pa.clone().applyQuaternion(a.q).add(a.pos),wb=j.pb.clone().applyQuaternion(b.q).add(b.pos),delta=wb.sub(wa),dist=delta.length();if(dist<1e-5)return;const n=delta.multiplyScalar(1/dist),sum=a.invMass+b.invMass,err=Math.min(.45,dist);a.pos.addScaledVector(n,err*a.invMass/sum*.82);b.pos.addScaledVector(n,-err*b.invMass/sum*.82);const ra=j.pa.clone().applyQuaternion(a.q),rb=j.pb.clone().applyQuaternion(b.q),ca=new THREE.Vector3().crossVectors(ra,n),cb=new THREE.Vector3().crossVectors(rb,n),effective=sum+ca.lengthSq()*a.invI+cb.lengthSq()*b.invI,va=a.vel.clone().add(new THREE.Vector3().crossVectors(a.omega,ra)),vb=b.vel.clone().add(new THREE.Vector3().crossVectors(b.omega,rb)),relative=vb.sub(va).dot(n),bias=Math.min(2,err*.16/Math.max(dt,.001)),impulse=-(relative+bias)/Math.max(effective,.001)*.35;a.vel.addScaledVector(n,-impulse*a.invMass);b.vel.addScaledVector(n,impulse*b.invMass);a.omega.addScaledVector(ca,-impulse*a.invI);b.omega.addScaledVector(cb,impulse*b.invI);}
-function stepRagdollPhysics(state,dt){if(!state)return false;const solids=world.filter(solid).map(b=>({a:getAABB(b)})),steps=Math.max(1,Math.ceil(Math.min(dt,.06)/.016)),h=Math.min(dt,.06)/steps;
-  for(let step=0;step<steps;step++){for(const b of Object.values(state.bodies)){b.hit=false;if(b.targetPos){b.pos.lerp(b.targetPos,1-Math.exp(-h*18));b.q.slerp(b.targetQ,1-Math.exp(-h*18));continue;}b.vel.y-=24*h;b.pos.addScaledVector(b.vel,h);b.omega.multiplyScalar(Math.exp(-1.25*h));const speed=b.omega.length();if(speed>1e-5)b.q.multiply(new THREE.Quaternion().setFromAxisAngle(b.omega.clone().normalize(),speed*h)).normalize();collideRagdollBody(b,solids,h);}for(let i=0;i<6;i++)for(const j of state.joints)solveRagdollJoint(state,j,h);collideRagdollPairs(state);for(const b of Object.values(state.bodies))if(!b.targetPos)collideRagdollBody(b,solids,h);}
-  state.hit=Object.values(state.bodies).some(b=>b.hit);state.grounded=Object.values(state.bodies).some(b=>b.hit&&b.vel.y<1);state.elapsed+=dt;return state.hit;
-}
-function placeRagdollRig(rig,state){const b=state.bodies,torso=b.torso,q=torso.q.clone(),inv=q.clone().invert(),sc=rig.sc,rootOffset=new THREE.Vector3(0,(state.L+state.T/2),0).multiplyScalar(1).applyQuaternion(q);rig.root.position.copy(torso.pos).sub(rootOffset);rig.root.quaternion.copy(q);rig.root.scale.setScalar(sc);rig.motion.position.set(0,0,0);rig.motion.quaternion.identity();rig.upper.position.set(0,rig.L,0);rig.upper.quaternion.identity();const upperOrigin=torso.pos.clone().add(new THREE.Vector3(0,-state.T/2,0).applyQuaternion(q));
-  const local=(p,origin)=>p.clone().sub(origin).applyQuaternion(inv).multiplyScalar(1/sc);rig.head.position.copy(local(b.head.pos,upperOrigin));rig.head.quaternion.copy(inv).multiply(b.head.q).normalize();
-  for(const [key,name] of [['shL','armL'],['shR','armR']]){const arm=b[name],shoulder=arm.pos.clone().add(new THREE.Vector3(0,state.armLen/2,0).applyQuaternion(arm.q));rig[key].position.copy(local(shoulder,upperOrigin));rig[key].quaternion.copy(inv).multiply(arm.q).normalize();}
-  for(const [key,name] of [['hpL','legL'],['hpR','legR']]){const leg=b[name],hip=leg.pos.clone().add(new THREE.Vector3(0,state.legLen/2,0).applyQuaternion(leg.q));rig[key].position.copy(local(hip,rig.root.position));rig[key].quaternion.copy(inv).multiply(leg.q).normalize();}
-}
-function resetRagdollRig(rig,yaw=0){if(!rig)return;rig.root.rotation.set(0,yaw,0);rig.root.scale.setScalar(rig.sc);rig.motion.position.set(0,0,0);rig.motion.quaternion.identity();rig.upper.position.set(0,rig.L,0);rig.upper.rotation.set(0,0,0);for(const key of ['head','shL','shR','hpL','hpR']){rig[key].position.copy(rig.rest[key]);rig[key].rotation.set(0,0,0);}for(const key of Object.keys(rig.cur))rig.cur[key]=0;}
 function applyPose(rig, p, dt) {
   const k = 1 - Math.exp(-dt * 18), c = rig.cur;
   for (const key of POSE_KEYS) c[key] += ((p[key] ?? 0) - c[key]) * k;
@@ -2729,7 +2788,7 @@ function toggleCamMode() { camMode = camMode === 'third' ? 'first' : 'third'; $(
 
 const PL = { r: .35, h: 2.3 };
 let me = newPlayer();
-function newPlayer() { return { x: 0, y: 8, z: 0, vy: 0, grounded: false, rot: 0, speed: 0, phase: 0, emote: 0, sq: 1, sqv: 0, touching: new Set(), coyote: 0, jumpBuf: 0, stepLift: null, ragdoll: 0, ragdollState:null }; }
+function newPlayer() { return { x: 0, y: 8, z: 0, vy: 0, grounded: false, rot: 0, speed: 0, phase: 0, emote: 0, sq: 1, sqv: 0, touching: new Set(), coyote: 0, jumpBuf: 0 }; }
 const solid = b => b.canCollide !== false && b.on !== false;
 function groundBelow(px, py, pz) {
   let best = -Infinity;
@@ -2753,17 +2812,7 @@ function overlaps(px, py, pz) {
   }
   return false;
 }
-function stepTopAt(px,pz,footY) {
-  let best=Infinity;
-  for(const b of world){if(!solid(b))continue;const bb=getAABB(b);if(px+PL.r<=bb.x||px-PL.r>=bb.x+bb.w||pz+PL.r<=bb.z||pz-PL.r>=bb.z+bb.d)continue;const top=bb.y+bb.h;if(top>footY+.06&&top<=footY+1.15&&top<best)best=top;}
-  return Number.isFinite(best)?best:null;
-}
-function moveAxis(ax,d) {
-  if(!d)return;const old=me[ax];me[ax]+=d;if(!overlaps(me.x,me.y,me.z))return;
-  const target=me.grounded?stepTopAt(me.x,me.z,me.y):null;
-  if(target!==null){const oldY=me.y;me.y=target;const clear=!overlaps(me.x,me.y,me.z);me.y=oldY;if(clear){me.stepLift={from:oldY,to:target,time:0,duration:clamp((target-oldY)*.24,.14,.28)};return;}}
-  me[ax]=old;
-}
+function moveAxis(ax, d) { const old = me[ax]; me[ax] += d; if (!overlaps(me.x, me.y, me.z)) return; const oy = me.y; me.y += 1.1; if (!overlaps(me.x, me.y, me.z)) return; me.y = oy; me[ax] = old; }
 
 function sandboxRuntime(post) {
   let hooks = { start: [], tick: [], touch: {} };
@@ -2793,8 +2842,6 @@ function sandboxRuntime(post) {
     pauseAnimation: () => emit('animPause', []),
     resumeAnimation: () => emit('animResume', []),
     animationSpeed: speed => emit('animSpeed', [+speed]),
-    ragdoll: (seconds = 2) => emit('ragdoll', [Number(seconds) || 2]),
-    standUp: () => emit('standUp', []),
     teleport: (x, y, z) => emit('tp', [+x, +y, +z]),
     getPosition: () => ({ x: P.x, y: P.y, z: P.z }),
   };
@@ -2841,8 +2888,6 @@ function consoleLog(m) { const c = $('#con'); const d = document.createElement('
 function applyCmds(list) {
   for (const [op, a] of list) {
     if (op.startsWith('anim')) { animationCommand(op, a); continue; }
-    if(op==='ragdoll'){me.ragdoll=clamp(Number(a[0])||2,.1,30);me.ragdollState=createRagdollState(myRig,new THREE.Vector3(me.x,me.y,me.z),me.rot);me.grounded=false;me.stepLift=null;activeAnimation=null;continue;}
-    if(op==='standUp'){me.ragdoll=0;me.ragdollState=null;me.vy=0;me.stepLift=null;resetRagdollRig(myRig,me.rot);continue;}
     if (op === 'tp') { Object.assign(me, { x: a[0], y: a[1], z: a[2], vy: 0 }); continue; }
     if (op.startsWith('gui')) { applyGUICmd(op, a); continue; }
     const name = a[0];
@@ -3662,7 +3707,7 @@ function renderProjectTab() {
   $('#projDesc').oninput = e => { draftDesc = e.target.value; saveDraft(); };
   $('#script').oninput = e => { draftScript = e.target.value; saveDraft(); };
   $('#btnPlay2').onclick = startPlayTest;
-  $('#btnPub').onclick = openPublishWorldPicker;
+  $('#btnPub').onclick = publishGame;
 }
 
 function renderPalette() {
@@ -3734,58 +3779,45 @@ function enterStudio(fromProject) {
   updateSelOutline();
 }
 function startPlayTest() { saveDraft(); playProject(currentDraft(), 'studio'); }
-function openPublishWorldPicker() {
-  const worlds=accountWorlds().sort((a,b)=>(b.lastUsed||0)-(a.lastUsed||0));
-  if(!worlds.length){toast('Crie ou entre em um mundo antes de publicar.');return;}
-  const modal=document.createElement('div');modal.className='modal on';modal.id='publishWorldModal';
-  modal.innerHTML='<div class="box"><h2>🌐 Publicar em um mundo</h2><p class="hint">Escolha em qual mundo este jogo ficará disponível.</p><div id="publishWorldOptions" style="display:flex;flex-direction:column;gap:8px"></div><div class="row" style="justify-content:flex-end;margin-top:14px"><button id="publishWorldCancel">Cancelar</button><button class="pri" id="publishWorldConfirm">Publicar jogo</button></div></div>';
-  document.body.append(modal);const options=modal.querySelector('#publishWorldOptions');
-  worlds.forEach((w,i)=>{const label=document.createElement('label');label.style.cssText='display:flex;align-items:center;gap:10px;background:#2a2e36;padding:12px;border-radius:8px;cursor:pointer';label.innerHTML='<input type="radio" name="publishWorld" value="'+w.code+'" '+(i===0?'checked':'')+'><span><b></b><small style="display:block;color:#9aa3af"></small></span>';label.querySelector('b').textContent=w.name||w.code;label.querySelector('small').textContent=w.code+' · '+(w.role==='owner'?'Seu mundo':w.role==='published'?'Publicado':'Mundo acessado');options.append(label);});
-  modal.querySelector('#publishWorldCancel').onclick=()=>modal.remove();modal.querySelector('#publishWorldConfirm').onclick=()=>{const code=modal.querySelector('input[name="publishWorld"]:checked')?.value;modal.remove();if(code)publishGame(code);};
-}
-function publishGame(targetCode) {
+function publishGame() {
   const d = currentDraft();
   if (!d.name || d.name === 'Meu jogo') { toast('Dê um nome ao jogo'); return; }
-  const code=String(targetCode||'').toUpperCase();
-  const canShare=(NET.role==='host'&&(NET.worldCode||worldCode())===code)||(NET.role==='guest'&&NET.worldCode===code&&NET.conn?.open);
-  if(!canShare){toast('Entre nesse mundo ou hospede-o antes de publicar nele.');return;}
   const lib = loadLib();
   const id = draftId || uid();
-  const entry = { id, name: d.name, desc: d.desc, author: d.author, script: d.script, world: d.world, gui: d.gui, animations: d.animations, worldCode: code };
-  rememberWorld(code,'published');
+  const entry = { id, name: d.name, desc: d.desc, author: d.author, script: d.script, world: d.world, gui: d.gui, animations: d.animations };
   const i = lib.findIndex(p => p.id === id);
   if (i >= 0) lib[i] = entry; else lib.push(entry);
   saveLib(lib); draftId = id; saveDraft();
-  if(NET.role==='guest')NET.conn.send({t:'publish',entry});
   $('#codeOut').value = b64enc(entry);
   $('#codeModal').classList.add('on'); $('#codeOut').select();
   Sound.success();
 }
 
 function updatePlay(dt, t) {
-  if(me.ragdoll>0&&me.ragdollState){
-    const state=me.ragdollState;stepRagdollPhysics(state,dt);const torso=state.bodies.torso,offset=new THREE.Vector3(0,state.L+state.T/2,0).applyQuaternion(torso.q),base=torso.pos.clone().sub(offset),forward=new THREE.Vector3(0,0,1).applyQuaternion(torso.q);
-    me.x=base.x;me.y=base.y;me.z=base.z;me.rot=Math.atan2(forward.x,forward.z);me.vy=torso.vel.y;me.grounded=state.grounded;me.speed=Math.hypot(torso.vel.x,torso.vel.z);me.ragdoll=Math.max(0,me.ragdoll-dt);if(!me.ragdoll){me.ragdollState=null;resetRagdollRig(myRig,me.rot);}
-    if(me.y < -40){me.ragdoll=0;me.ragdollState=null;Object.assign(me,{x:0,y:8,z:0,vy:0,grounded:false});resetRagdollRig(myRig,me.rot);}
-  }else{
-    const { fwd, right } = camDirs(), a = axes();
-    const dir = fwd.multiplyScalar(a.z).add(right.multiplyScalar(a.x));
-    const walking = dir.lengthSq() > 0;
-    if (walking) { dir.normalize(); me.rot = Math.atan2(dir.x, dir.z); if (me.emote && me.emote !== 1) setEmote(0); }
-    const run = !!(keys.ShiftLeft || keys.ShiftRight), sp = run ? 12 : 7;
-    if (keys.Space&&!me.stepLift) me.jumpBuf = .15;
-    me.jumpBuf = Math.max(0, me.jumpBuf - dt);me.coyote = me.grounded ? .12 : Math.max(0, me.coyote - dt);
-    if (me.jumpBuf > 0 && me.coyote > 0&&!me.stepLift) { me.vy = 9.5; me.grounded = false; me.coyote = 0; me.jumpBuf = 0; me.sq = 1.15; me.sqv = 0; Sound.jump(); if (me.emote) setEmote(0); burst(me.x, me.y + .1, me.z, 6, '#e8edf3', 2, 1); }
-    me.speed += ((walking && me.grounded ? sp : (walking ? sp * .85 : 0)) - me.speed) * Math.min(1, dt * (me.grounded ? 10 : 3));
-    if(!me.stepLift){moveAxis('x', dir.x * sp * dt);if(!me.stepLift)moveAxis('z', dir.z * sp * dt);}
-    const vyBefore = me.vy,prev = me.y;let landed = false;
-    if(me.stepLift){const s=me.stepLift;s.time+=dt;const k=clamp(s.time/s.duration,0,1),ease=k*k*(3-2*k);me.y=s.from+(s.to-s.from)*ease;me.vy=0;me.grounded=true;if(k>=1)me.stepLift=null;}
-    else{me.vy-=30*dt;me.y+=me.vy*dt;if(me.vy<=0){const g=groundBelow(me.x,prev,me.z);if(me.y<=g){if(!me.grounded&&vyBefore<-7)landed=true;me.y=g;me.vy=0;me.grounded=true;}else me.grounded=false;}else{if(overlaps(me.x,me.y,me.z)){me.y=prev;me.vy=0;}me.grounded=false;}}
-    if (landed) { me.sq=.75;me.sqv=0;burst(me.x,me.y,me.z,14,'#e8edf3',3,2);Sound.land(); }
-    if (me.grounded&&me.speed>5&&Math.random()<dt*8)burst(me.x,me.y+.1,me.z,2,'#dfe6ee',1.2,.6);
-    me.sqv+=(-(me.sq-1)*180-me.sqv*14)*dt;me.sq+=me.sqv*dt;if(me.grounded)me.phase+=me.speed*dt*1.6;
-    if(me.y < -40)Object.assign(me,{x:0,y:8,z:0,vy:0,sq:1,sqv:0,stepLift:null,ragdoll:0,ragdollState:null});
-  }
+  const { fwd, right } = camDirs(), a = axes();
+  const dir = fwd.multiplyScalar(a.z).add(right.multiplyScalar(a.x));
+  const walking = dir.lengthSq() > 0;
+  if (walking) { dir.normalize(); me.rot = Math.atan2(dir.x, dir.z); if (me.emote && me.emote !== 1) setEmote(0); }
+  const run = !!(keys.ShiftLeft || keys.ShiftRight), sp = run ? 12 : 7;
+  if (keys.Space) me.jumpBuf = .15;
+  me.jumpBuf = Math.max(0, me.jumpBuf - dt);
+  me.coyote = me.grounded ? .12 : Math.max(0, me.coyote - dt);
+  if (me.jumpBuf > 0 && me.coyote > 0) { me.vy = 9.5; me.grounded = false; me.coyote = 0; me.jumpBuf = 0; me.sq = 1.15; me.sqv = 0; Sound.jump(); if (me.emote) setEmote(0); burst(me.x, me.y + .1, me.z, 6, '#e8edf3', 2, 1); }
+  me.speed += ((walking && me.grounded ? sp : (walking ? sp * .85 : 0)) - me.speed) * Math.min(1, dt * (me.grounded ? 10 : 3));
+  moveAxis('x', dir.x * sp * dt);
+  moveAxis('z', dir.z * sp * dt);
+  const vyBefore = me.vy;
+  me.vy -= 30 * dt;
+  const prev = me.y;
+  me.y += me.vy * dt;
+  let landed = false;
+  if (me.vy <= 0) { const g = groundBelow(me.x, prev, me.z); if (me.y <= g) { if (!me.grounded && vyBefore < -7) landed = true; me.y = g; me.vy = 0; me.grounded = true; } else me.grounded = false; } else { if (overlaps(me.x, me.y, me.z)) { me.y = prev; me.vy = 0; } me.grounded = false; }
+  if (landed) { me.sq = .75; me.sqv = 0; burst(me.x, me.y, me.z, 14, '#e8edf3', 3, 2); Sound.land(); }
+  if (me.grounded && me.speed > 5 && Math.random() < dt * 8) burst(me.x, me.y + .1, me.z, 2, '#dfe6ee', 1.2, .6);
+  me.sqv += (-(me.sq - 1) * 180 - me.sqv * 14) * dt;
+  me.sq += me.sqv * dt;
+  if (me.grounded) me.phase += me.speed * dt * 1.6;
+  if (me.y < -40) Object.assign(me, { x: 0, y: 8, z: 0, vy: 0, sq: 1, sqv: 0 });
   const nowSet = new Set(), touched = [];
   for (const b of world) {
     if (!b.name || b.on === false) continue;
@@ -3802,10 +3834,13 @@ function updatePlay(dt, t) {
   netUpdate(dt, t);
   for (const n of touched) { const b = world.find(q => q.name === n); if (b && /moeda/i.test(n)) { burst(b.x + b.w / 2, b.y + b.h / 2, b.z + b.d / 2, 18, '#ffd54a', 4, 6); Sound.collect(); } }
   if (camMode === 'third') orbit.target.set(me.x, me.y + 1.5, me.z);
-  if(me.ragdollState)placeRagdollRig(myRig,me.ragdollState);else{myRig.yaw+=angDiff(me.rot,myRig.yaw)*Math.min(1,dt*14);myRig.root.position.set(me.x,me.y,me.z);myRig.root.rotation.set(0,myRig.yaw,0);myRig.root.scale.set(myRig.sc*(2-me.sq),myRig.sc*me.sq,myRig.sc*(2-me.sq));applyPose(myRig,playerAnimationPose(dt)||poseTarget({emote:me.emote,grounded:me.grounded,vy:me.vy,speed:me.speed,phase:me.phase},t),dt);}
+  myRig.yaw += angDiff(me.rot, myRig.yaw) * Math.min(1, dt * 14);
+  myRig.root.position.set(me.x, me.y, me.z);
+  myRig.root.rotation.y = myRig.yaw;
+  myRig.root.scale.set(myRig.sc * (2 - me.sq), myRig.sc * me.sq, myRig.sc * (2 - me.sq));
+  applyPose(myRig, playerAnimationPose(dt) || poseTarget({ emote: me.emote, grounded: me.grounded, vy: me.vy, speed: me.speed, phase: me.phase }, t), dt);
 }
 function playProject(p, from) {
-  clearNetPlayers();
   activeAnimation = null;
   p = { ...p, animations: normalizeAnimations(p.animations) };
   playFrom = from; currentPlay = p; go('play'); setWorld(p.world); orbit.dist = 9; me = newPlayer();
@@ -3816,7 +3851,7 @@ function playProject(p, from) {
   if (NET.role !== 'guest') Runner.begin((p.script || '') + '\n' + compileBlocks(p.world || []));
   renderPlayerList();
 }
-function exitPlay() { if(NET.role==='host')NET.conns.forEach(c=>c.open&&c.send({t:'clearPlayers'}));clearNetPlayers();if(NET.role!=='host'||!worldCode())netDisconnect(); netShowPanel(false); touchCtrlShow(false); Runner.end(); currentPlay = null; $('#guiRuntime').querySelector('.guiContainer').innerHTML = ''; if (playFrom === 'studio') enterStudio(); else enterHome(); }
+function exitPlay() { netDisconnect(); netShowPanel(false); touchCtrlShow(false); Runner.end(); currentPlay = null; $('#guiRuntime').querySelector('.guiContainer').innerHTML = ''; if (playFrom === 'studio') enterStudio(); else enterHome(); }
 
 function opts(el, list, key) {
   el.innerHTML = '';
@@ -3855,8 +3890,6 @@ function loadLib() { try { return JSON.parse(localStorage.bv2_lib || '[]'); } ca
 function saveLib(l) { try { localStorage.bv2_lib = JSON.stringify(l); } catch (e) { toast('Biblioteca cheia: o navegador não aceita mais dados. Use projetos menores.'); } }
 function thumbEmoji(name) { if (/obby|parkour/i.test(name)) return '🏃'; if (/tycoon|build|city/i.test(name)) return '🏗'; if (/adventure|quest/i.test(name)) return '🗺'; if (/fight|combat|pvp/i.test(name)) return '⚔'; return '🎮'; }
 function renderHome() {
-  const status=$('#worldStatus'),copy=$('#worldCopy');if(status&&NET.role==='host')status.textContent='Mundo “'+(NET.worldName||NET.worldCode)+'” online. Código: '+NET.worldCode+' — mantenha esta página aberta para receber jogadores.';else if(status&&worldCode())status.textContent='Código salvo: '+worldCode()+'. Crie seu mundo para hospedar e receber jogadores.';if(copy)copy.style.display=worldCode()?'inline-block':'none';const nameInput=$('#worldNameIn'),savedOwner=accountWorlds().find(w=>w.role==='owner');if(nameInput&&!nameInput.value&&savedOwner)nameInput.value=savedOwner.name||'';
-  const saved=$('#worldSavedList');if(saved){saved.innerHTML='';for(const w of accountWorlds().sort((a,b)=>(b.lastUsed||0)-(a.lastUsed||0))){const row=document.createElement('div');row.className='row';row.style.cssText='background:#101217;padding:8px 10px;border-radius:8px;justify-content:space-between;flex-wrap:wrap';const title=document.createElement('span');title.textContent=(w.name||'Mundo sem nome')+' · '+w.code+' · '+(w.role==='owner'?'meu mundo':w.role==='published'?'publicado':'acessado');const actions=document.createElement('div');actions.className='row';const use=document.createElement('button');use.textContent='Usar código';use.onclick=()=>{$('#worldJoinCode').value=w.code;};actions.append(use);if(w.role==='owner'){const rename=document.createElement('button');rename.textContent='Renomear';rename.onclick=()=>{const next=prompt('Nome do mundo:',w.name||'');if(next===null)return;rememberWorld(w.code,'owner',next);if(NET.worldCode===w.code)NET.worldName=String(next).trim().slice(0,40)||'Meu mundo';renderHome();};const host=document.createElement('button');host.textContent='Hospedar';host.onclick=()=>netCreateWorld(w.code,w.name);actions.append(rename,host);}else{const join=document.createElement('button');join.textContent='Entrar';join.onclick=()=>netJoinWorld(w.code);actions.append(join);}row.append(title,actions);saved.append(row);}}
   const grid = $('#grid'); grid.innerHTML = '';
   const all = [DEMO, ...loadLib()];
   for (const p of all) {
@@ -3876,10 +3909,6 @@ function renderHome() {
     grid.append(c);
   }
 }
-$('#worldCreate').onclick=()=>netCreateWorld('', $('#worldNameIn').value);
-$('#worldJoin').onclick=()=>netJoinWorld($('#worldJoinCode').value);
-$('#worldJoinCode').addEventListener('input',e=>{e.target.value=e.target.value.toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,12);});
-$('#worldCopy').onclick=async()=>{try{await navigator.clipboard.writeText(worldCode());toast('Código do mundo copiado!');}catch{$('#worldJoinCode').value=worldCode();$('#worldJoinCode').select();toast('Código selecionado para copiar.');}};
 $('#impBtn').onclick = () => {
   try {
     const p = b64dec($('#impIn').value);
